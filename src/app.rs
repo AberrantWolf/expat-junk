@@ -16,7 +16,10 @@ use crate::cache::{self, TranslationCache};
 use crate::config::{Backend, Settings};
 use crate::document::{Document, RegionId};
 use crate::ocr;
-use crate::translate::{GeminiVision, TesseractText, TranslationRequest, TranslationResult, Translator};
+use crate::secrets::Secrets;
+use crate::translate::{
+    GeminiVision, TesseractText, TextApi, TranslationRequest, TranslationResult, Translator,
+};
 use crate::viewer::Viewer;
 
 /// How a region's source text was obtained — shown as a badge so the user knows
@@ -77,10 +80,16 @@ pub struct App {
     /// Most recent error, shown in the top bar.
     error: Option<String>,
     viewer: Viewer,
+    /// Local API-key store, edited via the Settings window.
+    secrets: Secrets,
+    show_settings: bool,
+    /// Scratch buffer for the API-key field (never pre-filled from `secrets`).
+    api_key_input: String,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::fonts::install(&cc.egui_ctx);
         Self {
             settings: Settings::load(),
             document: None,
@@ -91,6 +100,9 @@ impl App {
             pending: None,
             error: None,
             viewer: Viewer::default(),
+            secrets: Secrets::load(),
+            show_settings: false,
+            api_key_input: String::new(),
         }
     }
 }
@@ -110,6 +122,9 @@ impl eframe::App for App {
             pending,
             error,
             viewer,
+            secrets,
+            show_settings,
+            api_key_input,
         } = self;
 
         // --- collect a finished translation, if any --------------------------
@@ -181,9 +196,12 @@ impl eframe::App for App {
                     .add_enabled(can_translate, egui::Button::new("Translate selection"))
                     .clicked()
                 {
-                    start_translation(settings, document, *selected, cache, pending, error);
+                    start_translation(settings, document, *selected, secrets, cache, pending, error);
                 }
                 let _ = ui.button("Export…"); // TODO: export::export
+                if ui.button("Settings").clicked() {
+                    *show_settings = !*show_settings;
+                }
 
                 if pending.is_some() {
                     ui.separator();
@@ -294,7 +312,96 @@ impl eframe::App for App {
                 });
             }
         });
+
+        settings_window(&ctx, show_settings, settings, secrets, api_key_input);
     }
+}
+
+/// The Settings window: pick a provider/model and store its API key locally.
+fn settings_window(
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut Settings,
+    secrets: &mut Secrets,
+    api_key_input: &mut String,
+) {
+    egui::Window::new("Settings")
+        .open(open)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("Translation provider");
+            egui::ComboBox::from_id_salt("provider")
+                .selected_text(settings.backend.provider_label())
+                .show_ui(ui, |ui| {
+                    let is_gemini = matches!(settings.backend, Backend::GeminiVision { .. });
+                    if ui.selectable_label(is_gemini, "Gemini (vision)").clicked() && !is_gemini {
+                        settings.backend = Backend::default();
+                        settings.save();
+                    }
+                    for (label, api, ready) in [
+                        ("Google Translate", TextApi::Google, true),
+                        ("DeepL", TextApi::DeepL, false),
+                        ("Kagi", TextApi::Kagi, false),
+                    ] {
+                        let sel = matches!(&settings.backend, Backend::TesseractText { api: a } if *a == api);
+                        let text = if ready {
+                            label.to_string()
+                        } else {
+                            format!("{label} (coming soon)")
+                        };
+                        let resp = ui.add_enabled(ready, egui::SelectableLabel::new(sel, text));
+                        if resp.clicked() && !sel {
+                            settings.backend = Backend::TesseractText { api };
+                            settings.save();
+                        }
+                    }
+                });
+
+            // Model is Gemini-specific. Persist edits once the &mut borrow ends.
+            let mut model_changed = false;
+            if let Backend::GeminiVision { model } = &mut settings.backend {
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    model_changed = ui
+                        .add(
+                            egui::TextEdit::singleline(model)
+                                .hint_text("gemini-flash-lite-latest"),
+                        )
+                        .changed();
+                });
+            }
+            if model_changed {
+                settings.save();
+            }
+
+            ui.separator();
+            let provider = settings.backend.secret_id();
+            ui.label(format!("API key — {}", settings.backend.provider_label()));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(api_key_input)
+                        .password(true)
+                        .desired_width(240.0)
+                        .hint_text("paste API key"),
+                );
+                if ui.button("Save").clicked() && !api_key_input.is_empty() {
+                    secrets.set(provider, std::mem::take(api_key_input));
+                }
+            });
+            if secrets.get(provider).is_some() {
+                ui.colored_label(egui::Color32::from_rgb(0x4c, 0xaf, 0x50), "✓ a key is saved");
+            } else {
+                ui.colored_label(egui::Color32::GRAY, "no key saved yet");
+            }
+            if std::env::var("EXPAT_JUNK_API_KEY").is_ok_and(|v| !v.is_empty()) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xff, 0xa5, 0x00),
+                    "EXPAT_JUNK_API_KEY is set and overrides saved keys",
+                );
+            }
+            ui.separator();
+            ui.small("Keys are stored in secrets.json in your config dir (owner-only), not in git.");
+        });
 }
 
 /// A small colored badge naming how the source text was/will be obtained.
@@ -309,10 +416,12 @@ fn badge(ui: &mut egui::Ui, method: SourceMethod) {
 /// Crop the selected region and kick off a background translation. The worker
 /// resolves the source text (text layer → OCR), checks/populates the shared
 /// cache, and calls the translator. All errors land in `error`.
+#[allow(clippy::too_many_arguments)]
 fn start_translation(
     settings: &Settings,
     document: &Option<Document>,
     selected: Option<RegionId>,
+    secrets: &Secrets,
     cache: &Arc<Mutex<TranslationCache>>,
     pending: &mut Option<Pending>,
     error: &mut Option<String>,
@@ -333,7 +442,7 @@ fn start_translation(
         let t = doc.region_text(id);
         (!t.trim().is_empty()).then_some(t)
     };
-    let translator = match build_translator(settings) {
+    let translator = match build_translator(settings, secrets) {
         Ok(t) => t,
         Err(e) => {
             *error = Some(format!("{e:#}"));
@@ -403,9 +512,9 @@ fn backend_ids(backend: &Backend) -> (&'static str, String) {
     }
 }
 
-/// Build the configured translator, pulling the API key from the keychain/env.
-fn build_translator(settings: &Settings) -> Result<Box<dyn Translator + Send>> {
-    let api_key = crate::config::load_api_key(&settings.backend)?;
+/// Build the configured translator, pulling the API key from secrets/env.
+fn build_translator(settings: &Settings, secrets: &Secrets) -> Result<Box<dyn Translator + Send>> {
+    let api_key = crate::config::load_api_key(secrets, &settings.backend)?;
     Ok(match &settings.backend {
         Backend::GeminiVision { model } => Box::new(GeminiVision {
             api_key,

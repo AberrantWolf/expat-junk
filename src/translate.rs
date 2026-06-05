@@ -167,9 +167,62 @@ pub struct TesseractText {
 }
 
 impl Translator for TesseractText {
-    fn translate(&self, _req: &TranslationRequest) -> Result<TranslationResult> {
-        // TODO: leptess OCR on the crop (or use req.source_text when present),
-        // then call the selected TextApi. alternatives/explanation stay empty.
-        anyhow::bail!("TesseractText::translate not yet implemented")
+    fn translate(&self, req: &TranslationRequest) -> Result<TranslationResult> {
+        // Source text is resolved upstream (PDF text layer, or OCR), so this
+        // path is text-in/text-out and needs no image.
+        let source = req
+            .source_text
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context(
+                "no source text to translate: this page has no text layer — enable the \
+                 `ocr` feature to read it, or use “Gemini (vision)” which reads the image",
+            )?;
+        match self.api {
+            TextApi::Google => translate_google(&self.api_key, source, req.target_lang),
+            TextApi::DeepL => anyhow::bail!("DeepL isn't implemented yet — choose Google or Gemini"),
+            TextApi::Kagi => anyhow::bail!("Kagi isn't implemented yet — choose Google or Gemini"),
+        }
     }
+}
+
+/// Google Cloud Translation API **v2** (API-key auth). The source language is
+/// auto-detected (omitted) so we don't depend on a source-language setting.
+fn translate_google(
+    api_key: &str,
+    source_text: &str,
+    target_lang: &str,
+) -> Result<TranslationResult> {
+    let url = format!("https://translation.googleapis.com/language/translate/v2?key={api_key}");
+    let body = serde_json::json!({ "q": source_text, "target": target_lang, "format": "text" });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .context("calling Google Translate")?;
+
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().context("reading the Google Translate response")?;
+    if !status.is_success() {
+        let msg = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("Google Translate error ({status}): {msg}");
+    }
+    let translation = value
+        .pointer("/data/translations/0/translatedText")
+        .and_then(serde_json::Value::as_str)
+        .context("Google Translate response had no translation")?;
+
+    // Text APIs return just a string — no alternatives or notes.
+    Ok(TranslationResult {
+        source_text: source_text.to_string(),
+        translation: translation.to_string(),
+        alternatives: Vec::new(),
+        explanation: None,
+    })
 }

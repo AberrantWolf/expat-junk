@@ -39,21 +39,30 @@ cargo test           # run the test suite
 ## Translating: API key
 
 The default translator is **Google Gemini** (vision) — its free tier includes
-image input. Provide your own API key via an environment variable for now:
+image input, and it returns alternatives and notes. **Google Cloud Translation**
+(v2) is also supported: pick it under **Settings → Provider** (it needs the Cloud
+Translation API enabled on your project + an API key). Google translates text, so
+it works on digital PDFs directly; image/scanned pages need the `ocr` feature to
+extract text first. DeepL and Kagi are not implemented yet.
+
+Add your own API key in the app via **Settings → API key** (stored locally in
+`secrets.json` in your config dir, owner-only, never in git). Each provider has
+its own key slot.
+
+Alternatively, set an environment variable, which overrides the stored key
+(handy for one-off runs):
 
 ```fish
-set -x EXPAT_JUNK_API_KEY <your-gemini-api-key>
-cargo run
+set -x EXPAT_JUNK_API_KEY <your-gemini-api-key>   # fish
 ```
-
 ```bash
-# bash/zsh
-export EXPAT_JUNK_API_KEY=<your-gemini-api-key>
+export EXPAT_JUNK_API_KEY=<your-gemini-api-key>   # bash/zsh
 ```
 
 Then open a document, drag a box over some text, and click **Translate
 selection**. Repeat translations of the same text are served from a local cache
-(`~/.cache/expat-junk/translations.json`) — instant and free.
+(`~/.cache/expat-junk/translations.json`) — instant and free. Japanese and other
+CJK text renders via a bundled Noto Sans JP font.
 
 ## Optional: local OCR (Tesseract)
 

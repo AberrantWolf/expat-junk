@@ -84,9 +84,13 @@ The design was chosen deliberately; don't silently swap these out.
     `generateContent` with a `responseSchema` that forces JSON, so we parse source text +
     translation + alternatives + explanation directly. No separate OCR; the only path that
     fully populates the info panel, and the default because Gemini's free tier includes vision.
-  - `TesseractText` (**stub**): will OCR the crop locally (Tesseract, behind the `ocr` feature)
-    and send text to a classic API (`TextApi::{Google, DeepL, Kagi}`). Returns a bare string —
-    `alternatives`/`explanation` stay empty; honor that in the UI, don't fabricate them.
+  - `TesseractText` — the text-API path (`TextApi::{Google, DeepL, Kagi}`). Despite the name,
+    it does **not** OCR: the source text is resolved upstream (PDF text layer, or OCR in the
+    worker) and passed in via `req.source_text`; this translator just calls the text API with
+    that string, so it works on digital PDFs with no `ocr` feature. **Google** is implemented
+    (Cloud Translation API v2, API-key auth, source auto-detected); **DeepL/Kagi** are still
+    stubs and are shown disabled ("coming soon") in the Settings provider picker. Text APIs
+    return a bare string — `alternatives`/`explanation` stay empty; don't fabricate them.
 - **`ocr.rs`** — local Tesseract OCR (`leptess`), behind the `ocr` feature. `recognize(image,
   lang)` returns text for regions with no PDF text layer (images/scanned PDFs); `AVAILABLE` is a
   compile-time flag the UI uses to say whether OCR will run. Errors are formatted via `Display`
@@ -116,8 +120,16 @@ The design was chosen deliberately; don't silently swap these out.
   page regeneration/reflow — it was explicitly deferred as an open-ended fidelity problem.
 - **`config.rs`** — non-secret `Settings` (`load`/`save` as JSON under the platform config dir
   via `directories`). `source_lang` (OCR, Tesseract code) and `target_lang` are editable inline
-  in the toolbar and persisted on change. API keys still come from `EXPAT_JUNK_API_KEY` (the
-  `keyring` path is stubbed) — never stored in the settings file or git.
+  in the toolbar and persisted on change. `config::load_api_key(secrets, backend)` resolves the
+  key: `EXPAT_JUNK_API_KEY` env overrides, else the secrets store. `Backend::secret_id()` names
+  the credential per provider (`gemini`/`google`/`deepl`/`kagi`).
+- **`secrets.rs`** — API keys in `secrets.json` (config dir, owner-only on Unix), **separate**
+  from `settings.json` and out of git. Edited via the Settings window (`app::settings_window`),
+  keyed by provider. Not the OS keychain yet (`keyring` is still a dep but unused) — that's the
+  intended hardening.
+- **`fonts.rs`** — installs a bundled Noto Sans JP (`assets/fonts/`, OFL) as the last fallback
+  for both font families, so Japanese/CJK source and translated text render instead of tofu.
+  Called once from `App::new` via `cc.egui_ctx`.
 
 ## Native dependency gotchas
 

@@ -14,7 +14,9 @@ mod cache;
 mod config;
 mod document;
 mod export;
+mod fonts;
 mod ocr;
+mod secrets;
 mod translate;
 mod viewer;
 

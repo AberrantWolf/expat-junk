@@ -29,6 +29,32 @@ impl Default for Backend {
     }
 }
 
+impl Backend {
+    /// Identifier for the API credential this backend needs (the secrets key).
+    pub fn secret_id(&self) -> &'static str {
+        match self {
+            Backend::GeminiVision { .. } => "gemini",
+            Backend::TesseractText { api } => match api {
+                TextApi::Google => "google",
+                TextApi::DeepL => "deepl",
+                TextApi::Kagi => "kagi",
+            },
+        }
+    }
+
+    /// Human-readable provider name for the settings UI.
+    pub fn provider_label(&self) -> &'static str {
+        match self {
+            Backend::GeminiVision { .. } => "Gemini (vision)",
+            Backend::TesseractText { api } => match api {
+                TextApi::Google => "Google Translate",
+                TextApi::DeepL => "DeepL",
+                TextApi::Kagi => "Kagi",
+            },
+        }
+    }
+}
+
 /// Persisted, non-secret settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -76,9 +102,22 @@ impl Settings {
     }
 }
 
-/// Fetch the API key for the active backend from the OS keychain.
-pub fn load_api_key(_backend: &Backend) -> Result<String> {
-    // TODO: keyring::Entry once a backend feature is enabled.
-    std::env::var("EXPAT_JUNK_API_KEY")
-        .map_err(|_| anyhow::anyhow!("no API key configured (set EXPAT_JUNK_API_KEY for now)"))
+/// Fetch the API key for the active backend. The `EXPAT_JUNK_API_KEY` env var
+/// overrides everything (handy for dev); otherwise it comes from the local
+/// secrets store, set via the Settings window.
+pub fn load_api_key(secrets: &crate::secrets::Secrets, backend: &Backend) -> Result<String> {
+    if let Ok(key) = std::env::var("EXPAT_JUNK_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
+    }
+    secrets
+        .get(backend.secret_id())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no API key set for {} — open Settings to add one",
+                backend.provider_label()
+            )
+        })
 }

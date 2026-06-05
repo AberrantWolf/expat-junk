@@ -61,9 +61,10 @@ export EXPAT_JUNK_API_KEY=<your-gemini-api-key>   # bash/zsh
 ```
 
 Then open a document, drag a box over some text, and click **Translate
-selection**. Repeat translations of the same text are served from a local cache
-(`~/.cache/expat-junk/translations.json`) — instant and free. Japanese and other
-CJK text renders via a bundled Noto Sans JP font.
+selection** — or draw several regions and use **Edit → Translate all** to
+translate them in one go. Repeat translations of the same text are served from a
+local cache (`~/.cache/expat-junk/translations.json`) — instant and free.
+Japanese and other CJK text renders via a bundled Noto Sans JP font.
 
 ## Saving & exporting
 

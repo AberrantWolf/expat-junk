@@ -6,7 +6,7 @@
 //! [`crate::viewer::Viewer`]. Menu/toolbar clicks are collected as an [`Action`]
 //! and executed after the panels render, which keeps borrows simple.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -76,6 +76,7 @@ enum Action {
     Export,
     Quit,
     Translate,
+    TranslateAll,
     DeleteSelected,
     ClearTranslations,
     ToggleSettings,
@@ -97,6 +98,9 @@ pub struct App {
     /// Persistent cache so repeat translations are free. Shared with the worker.
     cache: Arc<Mutex<TranslationCache>>,
     pending: Option<Pending>,
+    /// Regions queued for batch translation ("Translate all"), processed one at
+    /// a time through `pending`.
+    queue: VecDeque<RegionId>,
     error: Option<String>,
     viewer: Viewer,
     secrets: Secrets,
@@ -120,6 +124,7 @@ impl App {
             results: HashMap::new(),
             cache: Arc::new(Mutex::new(TranslationCache::load())),
             pending: None,
+            queue: VecDeque::new(),
             error: None,
             viewer: Viewer::default(),
             secrets: Secrets::load(),
@@ -145,6 +150,7 @@ impl eframe::App for App {
             results,
             cache,
             pending,
+            queue,
             error,
             viewer,
             secrets,
@@ -164,11 +170,13 @@ impl eframe::App for App {
                 }
                 Ok(Err(e)) => {
                     *error = Some(format!("{e:#}"));
+                    queue.clear(); // abort any batch rather than repeat the failure
                     clear_pending = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     *error = Some("translation worker stopped unexpectedly".to_string());
+                    queue.clear();
                     clear_pending = true;
                 }
             }
@@ -178,6 +186,12 @@ impl eframe::App for App {
         }
 
         let mut action: Option<Action> = None;
+
+        // Count regions that still need translating (for the batch menu item).
+        let untranslated = document
+            .as_ref()
+            .map(|d| d.regions.iter().filter(|r| !results.contains_key(&r.id)).count())
+            .unwrap_or(0);
 
         // --- top panel: menu bar + toolbar -----------------------------------
         egui::Panel::top("topbar").show_inside(ui, |ui| {
@@ -215,6 +229,16 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
+                    if ui
+                        .add_enabled(
+                            untranslated > 0 && pending.is_none(),
+                            egui::Button::new(format!("Translate all ({untranslated})")),
+                        )
+                        .clicked()
+                    {
+                        action = Some(Action::TranslateAll);
+                        ui.close();
+                    }
                     if ui
                         .add_enabled(selected.is_some(), egui::Button::new("Delete selected region"))
                         .clicked()
@@ -397,7 +421,19 @@ impl eframe::App for App {
             }
             Some(Action::Quit) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Some(Action::Translate) => {
-                start_translation(settings, document, *selected, secrets, cache, pending, error);
+                if let Some(id) = *selected {
+                    start_translation(id, settings, document, secrets, cache, pending, error);
+                }
+            }
+            Some(Action::TranslateAll) => {
+                queue.clear();
+                if let Some(doc) = document.as_ref() {
+                    for r in &doc.regions {
+                        if !results.contains_key(&r.id) {
+                            queue.push_back(r.id);
+                        }
+                    }
+                }
             }
             Some(Action::DeleteSelected) => {
                 if let (Some(id), Some(doc)) = (*selected, document.as_mut()) {
@@ -414,6 +450,27 @@ impl eframe::App for App {
                 }
             }
             Some(Action::ToggleSettings) => *show_settings = !*show_settings,
+        }
+
+        // --- drive the batch queue: start the next region when idle ----------
+        if pending.is_none() {
+            while let Some(next) = queue.pop_front() {
+                let still_valid = document
+                    .as_ref()
+                    .is_some_and(|d| d.regions.iter().any(|r| r.id == next))
+                    && !results.contains_key(&next);
+                if still_valid {
+                    start_translation(next, settings, document, secrets, cache, pending, error);
+                    // If it couldn't even start (e.g. no API key), abort the batch.
+                    if pending.is_none() {
+                        queue.clear();
+                    }
+                    break;
+                }
+            }
+        }
+        if pending.is_some() || !queue.is_empty() {
+            ctx.request_repaint();
         }
 
         // --- window title reflects the project + dirty state -----------------
@@ -661,15 +718,15 @@ fn save_project(
 /// resolves the source text (text layer → OCR), checks/populates the shared
 /// cache, and calls the translator. All errors land in `error`.
 fn start_translation(
+    id: RegionId,
     settings: &Settings,
     document: &Option<Document>,
-    selected: Option<RegionId>,
     secrets: &Secrets,
     cache: &Arc<Mutex<TranslationCache>>,
     pending: &mut Option<Pending>,
     error: &mut Option<String>,
 ) {
-    let (Some(id), Some(doc)) = (selected, document.as_ref()) else {
+    let Some(doc) = document.as_ref() else {
         return;
     };
     let crop = match doc.crop(id) {

@@ -284,3 +284,54 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 }
+
+#[cfg(test)]
+mod orientation_test {
+    use super::*;
+    use crate::document::Document;
+
+    #[test]
+    fn export_is_not_vertically_flipped() {
+        let src = std::env::temp_dir().join("expat-junk-orient-src.pdf");
+        let bytes = printpdf::PdfDocument::new("src")
+            .with_pages(vec![printpdf::PdfPage::new(
+                printpdf::Mm(210.0),
+                printpdf::Mm(297.0),
+                Vec::new(),
+            )])
+            .save(&printpdf::PdfSaveOptions::default(), &mut Vec::new());
+        std::fs::write(&src, bytes).unwrap();
+
+        let mut doc = Document::open(&src).unwrap();
+        // Paint a red marker across the top-left tenth of the page bitmap.
+        let (bw, bh) = (doc.pages[0].bitmap.width(), doc.pages[0].bitmap.height());
+        for y in 0..bh / 10 {
+            for x in 0..bw / 10 {
+                doc.pages[0].bitmap.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+            }
+        }
+
+        let out = std::env::temp_dir().join("expat-junk-orient-out.pdf");
+        export_pdf(&doc, &HashMap::new(), &out).unwrap();
+
+        // Re-render the exported PDF and confirm the marker is still at the top.
+        let pdfium = junk_libs_pdfium::instance().unwrap();
+        let rendered = junk_libs_pdfium::render_pdf(pdfium, &out, 1.0).unwrap();
+        let img = &rendered[0].image;
+        let (rw, rh) = (img.width(), img.height());
+        let top_left = img.get_pixel(rw / 20, rh / 20);
+        let bottom_left = img.get_pixel(rw / 20, rh - rh / 20);
+
+        assert!(
+            top_left[0] > 150 && top_left[1] < 100,
+            "top-left not red — export is vertically flipped: {top_left:?}"
+        );
+        assert!(
+            !(bottom_left[0] > 150 && bottom_left[1] < 100),
+            "bottom-left is red — export is vertically flipped: {bottom_left:?}"
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+    }
+}

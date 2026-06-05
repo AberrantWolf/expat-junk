@@ -124,8 +124,8 @@ The design was chosen deliberately; don't silently swap these out.
   correctly). Each annotated page raster is embedded full-size into a `printpdf` page (the
   `images` feature; `from_dynamic_image` from raw RGBA → `Op::UseXobject` at a DPI that fills the
   page). One multi-page PDF out. Trade-offs: everything becomes raster (vector text not retained),
-  flat fill seams on textured backgrounds — accepted per "no loss if we can't". **Verify export
-  orientation** the first time (PDF image Y-axis); flip the image before embedding if upside down.
+  flat fill seams on textured backgrounds — accepted per "no loss if we can't". Orientation is
+  verified upright by a headless test (export → re-render → check a top-left marker).
   `lopdf` is still a dep but unused here (a future vector-overlay path could keep original text).
 - **`project.rs`** — save/resume. A `.expj` JSON file (`Project`) references the **source by
   path** (not the rendered pages — re-derived on load) and stores regions, the id counter,

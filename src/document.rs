@@ -148,6 +148,19 @@ impl Document {
         self.regions.retain(|r| r.id != id);
     }
 
+    /// The next region id to be allocated — saved in the project file so ids
+    /// stay stable across save/resume.
+    pub fn next_region_id(&self) -> u64 {
+        self.next_region_id
+    }
+
+    /// Replace the regions (and id counter) when loading a project onto a freshly
+    /// opened source document.
+    pub fn restore_regions(&mut self, regions: Vec<Region>, next_region_id: u64) {
+        self.regions = regions;
+        self.next_region_id = next_region_id;
+    }
+
     /// Crop the rendered bitmap to a region, for sending to a vision Translator.
     /// Maps the region's page-point rect to bitmap pixels via the page's render
     /// scale (`bitmap pixels / page points`).

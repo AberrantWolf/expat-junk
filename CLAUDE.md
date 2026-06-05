@@ -45,7 +45,10 @@ The design was chosen deliberately; don't silently swap these out.
   what keeps the egui-vs-anything-else decision reversible and the backend testable.
   `viewer.rs` is deliberately self-contained (takes `&mut Document` + the selection, owns
   only its texture and in-progress drag) so it can later be lifted into a shared
-  `junk-libs-egui-pdfview` widget.
+  `junk-libs-egui-pdfview` widget. `app.rs` has a **menu bar** (File/Edit/Settings) over a
+  toolbar; menu/shortcut clicks are collected into an `Action` enum and executed *after* the
+  panels render — this sidesteps borrow conflicts between the menu closures and the field-level
+  `&mut` borrows the panels need.
 - **eframe 0.34 API note:** the `App` trait method is `fn ui(&mut self, ui: &mut egui::Ui,
   …)` (not the older `update(&mut self, ctx, …)`), and panels use `.show_inside(ui, …)`
   (not `.show(ctx, …)`). Match this when adding UI.
@@ -73,12 +76,15 @@ The design was chosen deliberately; don't silently swap these out.
   screen pixels** — the UI converts using its zoom; `CharBox` is already flipped to match.
   Regions carry a stable `RegionId` so UI state, cached translations, and export overlays all
   refer to the same box across edits.
-- **`viewer.rs`** — the interactive page canvas. Renders the current page to an egui texture
-  and lets the user draw / select / move / resize / delete regions over it. All geometry stays
-  in page points; the page↔screen transform is recomputed each frame from the displayed image
-  rect, so it stays correct when zoom lands. **Deferred:** real zoom + re-render at
-  zoom×DPI (pages currently render once at a fixed scale, displayed near native size — crisp
-  but not yet zoomable), and snapping region edges to `char_boxes`.
+- **`viewer.rs`** — the interactive page canvas, with its own control bar (zoom −/%/+, Fit
+  width, page ◀/▶). Renders the current page to an egui texture and lets the user draw / select
+  / move / resize / delete regions. All geometry stays in page points; the page↔screen transform
+  is derived each frame from the displayed image rect, so it's correct at any zoom. Zoom is
+  **display scaling** of the base-resolution texture (Ctrl+scroll or the buttons) — it changes
+  region-selection precision but not raster crispness; true **re-render at zoom×DPI is still
+  deferred** (pages render once at `DEFAULT_RENDER_ZOOM`). Drag start uses `pointer.press_origin()`
+  (not `interact_pointer_pos`, which is only sampled after the drag threshold and offsets the
+  start). **Deferred:** crisp high-zoom re-render, and snapping region edges to `char_boxes`.
 - **`translate.rs`** — one `Translator` trait, two impls:
   - `GeminiVision` (**default, implemented**): POSTs the region crop (PNG, base64) to Gemini's
     `generateContent` with a `responseSchema` that forces JSON, so we parse source text +
@@ -112,12 +118,20 @@ The design was chosen deliberately; don't silently swap these out.
   is the fallback when there's no source text at all. `Document::region_text` pulls text from
   `char_boxes` (chars whose box overlaps the region by ≥`CHAR_COVERAGE_THRESHOLD` — loose, since
   users draw imprecisely); OCR fills the same role for no-text-layer pages.
-- **`export.rs`** — **overlay on original, not reflow.** For each region: sample the
-  background color around the source block, paint a solid cover rectangle, overprint the
-  translated text. Layout is preserved; solid fill leaves visible seams on photo/textured
-  backgrounds, which is an accepted loss ("no loss if we can't"). PDFs via
-  `lopdf` + `printpdf`; images re-rastered via the `image` crate. Don't reach for full
-  page regeneration/reflow — it was explicitly deferred as an open-ended fidelity problem.
+- **`export.rs`** — **overlay on the rendered raster → PDF** (implemented). For each translated
+  region: sample the background (1px ring around it) → fill a flat cover rectangle → draw the
+  translation wrapped and auto-sized with `ab_glyph` + the bundled CJK font (so Japanese exports
+  correctly). Each annotated page raster is embedded full-size into a `printpdf` page (the
+  `images` feature; `from_dynamic_image` from raw RGBA → `Op::UseXobject` at a DPI that fills the
+  page). One multi-page PDF out. Trade-offs: everything becomes raster (vector text not retained),
+  flat fill seams on textured backgrounds — accepted per "no loss if we can't". **Verify export
+  orientation** the first time (PDF image Y-axis); flip the image before embedding if upside down.
+  `lopdf` is still a dep but unused here (a future vector-overlay path could keep original text).
+- **`project.rs`** — save/resume. A `.expj` JSON file (`Project`) references the **source by
+  path** (not the rendered pages — re-derived on load) and stores regions, the id counter,
+  translations (`results`), page, and the source/target lang + backend. `project::open_document`
+  reopens the source and re-applies the regions. `app.rs` tracks `source_path`/`project_path`/
+  `dirty`; the window title reflects the file + a `*` when dirty.
 - **`config.rs`** — non-secret `Settings` (`load`/`save` as JSON under the platform config dir
   via `directories`). `source_lang` (OCR, Tesseract code) and `target_lang` are editable inline
   in the toolbar and persisted on change. `config::load_api_key(secrets, backend)` resolves the

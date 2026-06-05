@@ -6,10 +6,11 @@ provider you configure with your own API key. Clicking a translated region shows
 the source text, the translation, and (provider permitting) alternatives and
 notes — with a badge telling you how the source text was obtained.
 
-> Status: early development. The render + region-editing surface and the
-> Gemini vision translation path (with a persistent, token-saving cache) work
-> today. Classic text APIs, baking translations back into an output document,
-> and zoom are still in progress.
+> Status: early development. Working today: open PDFs/images, draw/zoom/page
+> through and edit translation regions, translate via Gemini (vision) or Google
+> Cloud Translation with a persistent token-saving cache, save/resume your work
+> as a project file, and export a translated PDF. DeepL/Kagi and crisp
+> high-zoom re-rendering are still to come.
 
 ## Prerequisites
 
@@ -63,6 +64,17 @@ Then open a document, drag a box over some text, and click **Translate
 selection**. Repeat translations of the same text are served from a local cache
 (`~/.cache/expat-junk/translations.json`) — instant and free. Japanese and other
 CJK text renders via a bundled Noto Sans JP font.
+
+## Saving & exporting
+
+- **Save / resume:** **File → Save project** writes a `.expj` file (your regions and
+  translations; it references the source document by path rather than embedding it). **File →
+  Open project** restores a session. The title bar shows a `*` when there are unsaved changes.
+  Shortcuts: `Ctrl/Cmd+S` save, `Ctrl/Cmd+O` open document, `Ctrl/Cmd+E` export.
+- **Export:** **File → Export translated…** writes a PDF where each translated region is covered
+  with a background-matched box and the translation is drawn on top (CJK included). Untranslated
+  content is kept as-is. It's a raster overlay, so it doesn't retain the original's vector text —
+  good enough to read and share; a vector-preserving export is a future improvement.
 
 ## Optional: local OCR (Tesseract)
 

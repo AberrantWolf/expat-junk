@@ -16,6 +16,7 @@ mod document;
 mod export;
 mod fonts;
 mod ocr;
+mod project;
 mod secrets;
 mod translate;
 mod viewer;

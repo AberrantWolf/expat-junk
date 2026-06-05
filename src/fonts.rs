@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-const NOTO_SANS_JP: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf");
+/// Bundled Noto Sans JP (OFL). Also used by the export raster text renderer.
+pub const NOTO_SANS_JP: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf");
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();

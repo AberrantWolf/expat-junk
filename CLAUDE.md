@@ -19,7 +19,7 @@ a module by replacing its stubs, not by re-architecting around them.
 ```bash
 cargo run                 # launch the egui app
 cargo build               # default build; build.rs vendors PDFium on first run (see below)
-cargo build --features ocr   # also build the Tesseract OCR path (needs native libs)
+cargo build --features ocr   # also build the Tesseract OCR path (see deps below)
 cargo check               # fast type-check loop
 cargo test                # incl. the headless PDF render test (no display needed)
 cargo test renders_a_generated_pdf   # run that single test by name
@@ -79,24 +79,45 @@ The design was chosen deliberately; don't silently swap these out.
   rect, so it stays correct when zoom lands. **Deferred:** real zoom + re-render at
   zoom×DPI (pages currently render once at a fixed scale, displayed near native size — crisp
   but not yet zoomable), and snapping region edges to `char_boxes`.
-- **`translate.rs`** — one `Translator` trait, two shipped impls:
-  - `GeminiVision` (**default**): sends the region's image crop to Gemini Flash-Lite and
-    gets source text + translation + alternatives + explanation in one structured call.
-    No separate OCR. This is the only path that fully populates the info panel, and it's
-    the default because Gemini's free tier includes vision.
-  - `TesseractText`: OCR the crop locally (Tesseract, behind the `ocr` feature) and send
-    text to a classic API (`TextApi::{Google, DeepL, Kagi}`). Cheap/familiar, but returns
-    a bare string — `alternatives`/`explanation` stay empty. Honor that in the UI; don't
-    fabricate them.
+- **`translate.rs`** — one `Translator` trait, two impls:
+  - `GeminiVision` (**default, implemented**): POSTs the region crop (PNG, base64) to Gemini's
+    `generateContent` with a `responseSchema` that forces JSON, so we parse source text +
+    translation + alternatives + explanation directly. No separate OCR; the only path that
+    fully populates the info panel, and the default because Gemini's free tier includes vision.
+  - `TesseractText` (**stub**): will OCR the crop locally (Tesseract, behind the `ocr` feature)
+    and send text to a classic API (`TextApi::{Google, DeepL, Kagi}`). Returns a bare string —
+    `alternatives`/`explanation` stay empty; honor that in the UI, don't fabricate them.
+- **`ocr.rs`** — local Tesseract OCR (`leptess`), behind the `ocr` feature. `recognize(image,
+  lang)` returns text for regions with no PDF text layer (images/scanned PDFs); `AVAILABLE` is a
+  compile-time flag the UI uses to say whether OCR will run. Errors are formatted via `Display`
+  (not `?`) so the code doesn't depend on the leptess error types being `Send + Sync`. Source
+  language is `Settings::source_lang` (a Tesseract code).
+- **Translation runs on a background worker** in `app.rs` (`run_translation`, spawned per
+  request; the call is blocking `reqwest`), result returned over an `mpsc` channel polled each
+  frame — the UI never freezes. The worker resolves the source text (**text layer → OCR**),
+  records the `SourceMethod` used, checks/populates the **shared** cache (`Arc<Mutex>`), then
+  calls the translator. Doing the cache lookup *after* OCR is why the cache is shared with the
+  worker rather than checked on the UI thread. The API key comes from `config::load_api_key`
+  (`EXPAT_JUNK_API_KEY` env for now). The info panel shows the detected source text up front (a
+  live `region_text` preview for text-layer regions) and a colored badge naming the method
+  (PDF text layer / OCR / image-vision), so the user sees what's being sent.
+- **`cache.rs`** — persistent translation cache so repeat translations are instant and spend no
+  tokens. Two key namespaces (`sha2`-hashed, stored as JSON in the user's cache dir):
+  `key_text` (provider, model, lang, **normalized source text**) is preferred — the same text
+  hits regardless of how the box was drawn/sized/rendered; `key_pixels` (… **region pixels**)
+  is the fallback when there's no source text at all. `Document::region_text` pulls text from
+  `char_boxes` (chars whose box overlaps the region by ≥`CHAR_COVERAGE_THRESHOLD` — loose, since
+  users draw imprecisely); OCR fills the same role for no-text-layer pages.
 - **`export.rs`** — **overlay on original, not reflow.** For each region: sample the
   background color around the source block, paint a solid cover rectangle, overprint the
   translated text. Layout is preserved; solid fill leaves visible seams on photo/textured
   backgrounds, which is an accepted loss ("no loss if we can't"). PDFs via
   `lopdf` + `printpdf`; images re-rastered via the `image` crate. Don't reach for full
   page regeneration/reflow — it was explicitly deferred as an open-ended fidelity problem.
-- **`config.rs`** — non-secret `Settings` as JSON under the platform config dir
-  (`directories`); API keys via the OS keychain (`keyring`), never in the settings file or
-  git. Users always supply their own keys.
+- **`config.rs`** — non-secret `Settings` (`load`/`save` as JSON under the platform config dir
+  via `directories`). `source_lang` (OCR, Tesseract code) and `target_lang` are editable inline
+  in the toolbar and persisted on change. API keys still come from `EXPAT_JUNK_API_KEY` (the
+  `keyring` path is stubbed) — never stored in the settings file or git.
 
 ## Native dependency gotchas
 
@@ -111,8 +132,12 @@ These are the surprises to watch for — the rest is pure Rust.
   `pdfium_latest` (moving) or `pdfium_future` (needs an unreleased binary) features. This repo
   no longer carries a `build.rs` of its own.
 - **Tesseract** (`leptess`, `ocr` feature): links the system Tesseract + Leptonica C
-  libraries at **build** time, so the default build leaves it off. Enable with
-  `--features ocr` only when those libs are installed.
+  libraries at **build** time (via `pkg-config` for `lept`/`tesseract`), so the default
+  build leaves it off. To build `--features ocr` on Arch/CachyOS:
+  `sudo pacman -S leptonica tesseract tesseract-data-eng` (add `tesseract-data-<lang>` for
+  each OCR source language; `clang` is also needed for bindgen). Without the feature, `ocr.rs`
+  still compiles — `recognize()` just reports unavailability and regions fall back to the
+  vision/pixel path.
 - **keyring v4** needs a platform backend feature enabled to actually persist secrets
   (e.g. secret-service on Linux). Until that's wired, `config::load_api_key` falls back to
   the `EXPAT_JUNK_API_KEY` env var — fine for local dev, not the real story.

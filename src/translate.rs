@@ -12,7 +12,9 @@
 //!
 //! Users supply their own API keys (see [`crate::config`]).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use image::ImageEncoder as _;
 use serde::{Deserialize, Serialize};
 
 /// What the UI asks a backend to translate.
@@ -46,11 +48,108 @@ pub struct GeminiVision {
 }
 
 impl Translator for GeminiVision {
-    fn translate(&self, _req: &TranslationRequest) -> Result<TranslationResult> {
-        // TODO: reqwest (blocking) POST to Gemini generateContent with the crop
-        // as inline image data + a structured-output prompt; parse JSON.
-        anyhow::bail!("GeminiVision::translate not yet implemented")
+    fn translate(&self, req: &TranslationRequest) -> Result<TranslationResult> {
+        let png = encode_png(req.image)?;
+        let image_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let mut prompt = format!(
+            "The image is a cropped region of a document. Read the text in it and \
+             translate that text into {lang}. Return the detected source text, the \
+             translation, up to three alternative translations, and a short note on \
+             any nuance or ambiguity.",
+            lang = req.target_lang,
+        );
+        if let Some(src) = req.source_text {
+            prompt.push_str(&format!(
+                "\n\nThe source text was also extracted as: {src:?}. Prefer it if it \
+                 matches the image."
+            ));
+        }
+
+        // Force structured JSON so we don't have to scrape prose.
+        let body = serde_json::json!({
+            "contents": [{
+                "parts": [
+                    { "text": prompt },
+                    { "inlineData": { "mimeType": "image/png", "data": image_b64 } }
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_text": { "type": "string" },
+                        "translation": { "type": "string" },
+                        "alternatives": { "type": "array", "items": { "type": "string" } },
+                        "explanation": { "type": "string" }
+                    },
+                    "required": ["source_text", "translation"]
+                }
+            }
+        });
+
+        // Gemini takes the API key as a query parameter; keys are URL-safe.
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model, self.api_key
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .context("calling the Gemini API")?;
+
+        let status = resp.status();
+        let value: serde_json::Value = resp.json().context("reading the Gemini response")?;
+        if !status.is_success() {
+            let msg = value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            anyhow::bail!("Gemini API error ({status}): {msg}");
+        }
+
+        let text = value
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(serde_json::Value::as_str)
+            .context("Gemini response contained no text (blocked or empty?)")?;
+        let payload: GeminiPayload = serde_json::from_str(text)
+            .with_context(|| format!("parsing structured translation from: {text}"))?;
+
+        Ok(TranslationResult {
+            source_text: payload.source_text,
+            translation: payload.translation,
+            alternatives: payload.alternatives.unwrap_or_default(),
+            explanation: payload.explanation,
+        })
     }
+}
+
+/// The structured payload we ask Gemini to return (matches `responseSchema`).
+#[derive(Deserialize)]
+struct GeminiPayload {
+    source_text: String,
+    translation: String,
+    alternatives: Option<Vec<String>>,
+    explanation: Option<String>,
+}
+
+/// Encode an RGBA image as PNG bytes for upload.
+fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .context("encoding region as PNG")?;
+    Ok(buf)
 }
 
 /// Classic text APIs the OCR path can target.

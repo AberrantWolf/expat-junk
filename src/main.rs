@@ -10,9 +10,11 @@
 // API calls, and PDF generation are all backend modules with no egui dependency.
 
 mod app;
+mod cache;
 mod config;
 mod document;
 mod export;
+mod ocr;
 mod translate;
 mod viewer;
 

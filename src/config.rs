@@ -34,6 +34,10 @@ impl Default for Backend {
 pub struct Settings {
     pub backend: Backend,
     pub target_lang: String,
+    /// OCR source language as a Tesseract code (e.g. `eng`, `jpn`, `deu`). Only
+    /// used for the OCR fallback on pages with no text layer; the matching
+    /// tessdata must be installed. Vision/text-layer paths don't need it.
+    pub source_lang: String,
 }
 
 impl Default for Settings {
@@ -41,15 +45,34 @@ impl Default for Settings {
         Settings {
             backend: Backend::default(),
             target_lang: "en".to_string(),
+            source_lang: "eng".to_string(),
         }
     }
 }
 
 impl Settings {
-    /// Load settings from the platform config dir, or defaults if absent.
-    pub fn load() -> Result<Self> {
-        // TODO: read JSON from directories::ProjectDirs config_dir().
-        Ok(Settings::default())
+    fn config_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "expat-junk")
+            .map(|d| d.config_dir().join("settings.json"))
+    }
+
+    /// Load settings from the platform config dir, or defaults if absent/unreadable.
+    pub fn load() -> Self {
+        Self::config_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist settings to the platform config dir (best-effort).
+    pub fn save(&self) {
+        let Some(path) = Self::config_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
     }
 }
 

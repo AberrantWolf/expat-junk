@@ -7,9 +7,15 @@
 //! is kept in page points; the page↔screen transform is derived from the
 //! displayed image rect each frame, so it's correct at any zoom.
 
-use egui::{Color32, Pos2, Rect as ERect, Sense, Stroke, Vec2};
+use std::collections::HashMap;
 
+use ab_glyph::FontRef;
+use egui::{Color32, Pos2, Rect as ERect, Sense, Stroke, Vec2};
+use image::Rgba;
+
+use crate::app::{Justify, Rotate, Translated};
 use crate::document::{Document, Rect, RegionId};
+use crate::export::{render_region_patch, sample_background, PixelRect};
 
 /// Screen-space size of a corner resize handle, and the grab tolerance.
 const HANDLE: f32 = 7.0;
@@ -49,7 +55,38 @@ pub struct Viewer {
     zoom: f32,
     /// When true, zoom is recomputed each frame to fit the viewport width.
     fit: bool,
+    /// When true, translated regions render their text over the page (a live,
+    /// in-app preview of the export overlay); when false, only the region boxes
+    /// show so the original is unobstructed.
+    show_translations: bool,
+    /// Fonts used to rasterize the preview patches — the same bundled CJK font
+    /// the export uses (regular + bold, weight-pinned), so the preview matches
+    /// the output.
+    font: FontRef<'static>,
+    font_bold: FontRef<'static>,
+    /// Cached, GPU-uploaded translation patches keyed by region, rebuilt only
+    /// when a region's text/style/size changes.
+    patches: HashMap<RegionId, CachedPatch>,
     drag: Drag,
+}
+
+/// One region's rendered translation patch plus the inputs it was built from, so
+/// we can skip re-rendering when nothing relevant changed.
+struct CachedPatch {
+    key: PatchKey,
+    tex: egui::TextureHandle,
+}
+
+#[derive(Clone, PartialEq)]
+struct PatchKey {
+    text: String,
+    rotate: Rotate,
+    bg: [u8; 3],
+    justify: Justify,
+    bold: bool,
+    size_pt: Option<f32>,
+    w: u32,
+    h: u32,
 }
 
 impl Default for Viewer {
@@ -60,6 +97,10 @@ impl Default for Viewer {
             texture_scale: 0.0,
             zoom: 1.0,
             fit: true,
+            show_translations: true,
+            font: crate::fonts::weighted(false),
+            font_bold: crate::fonts::weighted(true),
+            patches: HashMap::new(),
             drag: Drag::Idle,
         }
     }
@@ -70,6 +111,7 @@ impl Viewer {
     pub fn reset(&mut self) {
         self.texture = None;
         self.texture_scale = 0.0;
+        self.patches.clear();
         self.drag = Drag::Idle;
         self.fit = true;
         self.zoom = 1.0;
@@ -84,6 +126,7 @@ impl Viewer {
         doc: &mut Document,
         current_page: &mut usize,
         selected: &mut Option<RegionId>,
+        results: &HashMap<RegionId, Translated>,
     ) -> bool {
         let total_pages = doc.pages.len();
         let mut edited = false;
@@ -102,6 +145,14 @@ impl Viewer {
             if ui.selectable_label(self.fit, "Fit width").clicked() {
                 self.fit = true;
             }
+
+            ui.separator();
+            ui.add_enabled_ui(!results.is_empty(), |ui| {
+                ui.selectable_label(self.show_translations, "Translations")
+                    .on_hover_text("Overlay translated text on the page (preview of the export)")
+                    .clicked()
+                    .then(|| self.show_translations = !self.show_translations);
+            });
 
             if total_pages > 1 {
                 ui.separator();
@@ -247,9 +298,14 @@ impl Viewer {
                 }
             }
             if let Some(id) = *selected {
-                let del = ui.input(|i| {
-                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
-                });
+                // Don't treat Delete/Backspace as "delete region" while a text
+                // widget (e.g. the translation editor in the info panel) holds
+                // keyboard focus — there those keys edit the text.
+                let editing = ui.memory(|m| m.focused().is_some());
+                let del = !editing
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+                    });
                 if del {
                     doc.remove_region(id);
                     *selected = None;
@@ -259,18 +315,89 @@ impl Viewer {
 
             // --- paint ---------------------------------------------------------
             let painter = ui.painter_at(rect.expand(HANDLE));
+            let page_bitmap = doc.pages.get(*current_page).map(|p| &p.bitmap);
             for region in doc.regions.iter().filter(|r| r.page == *current_page) {
                 let scr = ERect::from_min_size(
                     to_screen(egui::pos2(region.rect.x, region.rect.y)),
                     egui::vec2(region.rect.w * scale, region.rect.h * scale),
                 );
                 let is_sel = *selected == Some(region.id);
+
+                // Live translation overlay: render the region's styled patch with
+                // the *same* renderer the export uses, then draw it over the page —
+                // so this is a true preview of the output.
+                let translation = self
+                    .show_translations
+                    .then(|| results.get(&region.id))
+                    .flatten();
+                let mut drew_overlay = false;
+                if let (Some(t), Some(bmp)) = (translation, page_bitmap) {
+                    let w_px = (region.rect.w * bitmap_scale).round() as u32;
+                    let h_px = (region.rect.h * bitmap_scale).round() as u32;
+                    if w_px > 0 && h_px > 0 {
+                        let bg = match t.style.background {
+                            Some([r, g, b]) => Rgba([r, g, b, 255]),
+                            None => sample_background(
+                                bmp,
+                                PixelRect {
+                                    x: (region.rect.x * bitmap_scale).round() as i64,
+                                    y: (region.rect.y * bitmap_scale).round() as i64,
+                                    w: w_px as i64,
+                                    h: h_px as i64,
+                                },
+                            ),
+                        };
+                        let key = PatchKey {
+                            text: t.display_text().trim().to_owned(),
+                            rotate: t.style.rotate,
+                            bg: [bg[0], bg[1], bg[2]],
+                            justify: t.style.justify,
+                            bold: t.style.bold,
+                            size_pt: t.style.size_pt,
+                            w: w_px,
+                            h: h_px,
+                        };
+                        if self.patches.get(&region.id).map(|c| &c.key) != Some(&key) {
+                            let patch = render_region_patch(
+                                w_px,
+                                h_px,
+                                bg,
+                                t,
+                                &self.font,
+                                &self.font_bold,
+                                bitmap_scale,
+                            );
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [patch.width() as usize, patch.height() as usize],
+                                patch.as_raw(),
+                            );
+                            let tex = ui.ctx().load_texture(
+                                format!("tr-{}", region.id.0),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.patches.insert(region.id, CachedPatch { key, tex });
+                        }
+                        if let Some(c) = self.patches.get(&region.id) {
+                            painter.image(
+                                c.tex.id(),
+                                scr,
+                                ERect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            drew_overlay = true;
+                        }
+                    }
+                }
+
                 let (stroke_color, fill) = if is_sel {
                     (ACCENT, ACCENT_FILL)
                 } else {
                     (REGION_STROKE, REGION_FILL)
                 };
-                painter.rect_filled(scr, 2.0, fill);
+                if !drew_overlay {
+                    painter.rect_filled(scr, 2.0, fill);
+                }
                 painter.rect_stroke(
                     scr,
                     2.0,
@@ -290,6 +417,10 @@ impl Viewer {
                 let scr = ERect::from_two_pos(to_screen(start), to_screen(current));
                 painter.rect_stroke(scr, 0.0, Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
             }
+
+            // Drop cached patches whose regions are gone (deleted/cleared), so the
+            // texture memory is released.
+            self.patches.retain(|id, _| results.contains_key(id));
         });
 
         edited

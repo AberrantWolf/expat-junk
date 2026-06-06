@@ -89,9 +89,16 @@ The design was chosen deliberately; don't silently swap these out.
   scale changes. Image sources can't re-render (raster), so they just display-scale. Drag start
   uses `pointer.press_origin()` (not `interact_pointer_pos`, which is only sampled after the drag
   threshold and offsets the start). The re-render is synchronous on the UI thread (a brief hitch
-  per zoom quantum at high res); a background-thread render would smooth that. **Deferred:**
-  snapping region edges to `char_boxes`; lazy/bounded page-bitmap memory (all pages still eager-
-  render at `DEFAULT_RENDER_ZOOM`, and visited pages keep their last render scale).
+  per zoom quantum at high res); a background-thread render would smooth that. **Live translation
+  preview:** translated regions render their styled patch *over* the page via the **same**
+  `export::render_region_patch` the exporter uses (not an egui-native re-implementation), so the
+  preview is faithful to the output — including edited text, rotation, background override, and
+  alignment. Patches are rasterized at the page-bitmap scale, uploaded as per-region textures
+  cached by a `PatchKey` (text/rotate/bg/justify/size) and rebuilt only when that changes; the
+  cache is pruned to live regions each frame, and a control-bar "Translations" toggle hides the
+  overlay. **Deferred:** snapping region edges to `char_boxes`; lazy/bounded page-bitmap memory
+  (all pages still eager-render at `DEFAULT_RENDER_ZOOM`, and visited pages keep their last render
+  scale).
 - **`translate.rs`** — one `Translator` trait, two impls:
   - `GeminiVision` (**default, implemented**): POSTs the region crop (PNG, base64) to Gemini's
     `generateContent` with a `responseSchema` that forces JSON, so we parse source text +
@@ -117,7 +124,17 @@ The design was chosen deliberately; don't silently swap these out.
   worker rather than checked on the UI thread. The API key comes from `config::load_api_key`
   (`EXPAT_JUNK_API_KEY` env for now). The info panel shows the detected source text up front (a
   live `region_text` preview for text-layer regions) and a colored badge naming the method
-  (PDF text layer / OCR / image-vision), so the user sees what's being sent.
+  (PDF text layer / OCR / image-vision), so the user sees what's being sent. For a **translated**
+  region the panel also exposes per-region presentation overrides (`Translated.style`, a
+  `RegionStyle`): the source text and raw machine translation are shown read-only-but-copyable,
+  while the rendered **text** is editable (defaults to the machine translation; `None` keeps
+  tracking it, so re-translation updates it — and re-translating preserves the user's style),
+  plus **rotate 90° (none / clockwise / counter-clockwise, CW default)**, **background color
+  override**, **left/center/right justify**, **bold** (700 vs 400 weight), and an optional
+  **font size** in points (`size_pt`; `None` auto-fits the box, `Some` sets the starting size,
+  still shrunk to fit). These
+  persist in the project (`results` is serialized; `#[serde(default)]` keeps old projects
+  loadable) and feed both the live preview and the export.
 - **`cache.rs`** — persistent translation cache so repeat translations are instant and spend no
   tokens. Two key namespaces (`sha2`-hashed, stored as JSON in the user's cache dir):
   `key_text` (provider, model, lang, **normalized source text**) is preferred — the same text
@@ -135,8 +152,18 @@ The design was chosen deliberately; don't silently swap these out.
   - **Image → full raster** (`export_raster`): bake cover boxes + text onto the page raster and
     embed each page via `printpdf` (the `images` feature; `from_dynamic_image` → `Op::UseXobject`
     at a page-filling DPI).
-  Both are verified headless: valid PDF + upright orientation (raster), and overlay-placed-upright
-  + valid + page-count-preserved (vector). Background match is a flat fill (seams on texture).
+  Both build each region's patch through one shared `render_region_patch(w_px, h_px, bg, &Translated,
+  regular, bold, px_per_pt)` (also called by `viewer.rs` for the live preview), which applies the
+  region's `RegionStyle`: the displayed text (`Translated::display_text` — edited or machine),
+  `justify` (per-line offset in `draw_text`), `rotate` (a `Rotate` of `None`/`Cw`/`Ccw` — lay out in a
+  swapped-dim buffer then `rotate90` for clockwise / `rotate270` for counter-clockwise), `background`
+  (override color, else `sample_background`'s flat fill), `bold` (picks the `bold` vs `regular` font),
+  and `size_pt` (converted to buffer pixels via `px_per_pt` as `draw_text`'s starting size — `None`
+  starts at the region height; either way `draw_text` shrinks to fit). The two fonts are
+  weight-pinned instances of the one bundled variable font (`fonts::weighted(bold)`). Both are verified headless:
+  valid PDF + upright orientation (raster), and overlay-placed-upright + valid + page-count-preserved
+  (vector); a unit test (`patch_honors_style_overrides`) covers the style application. Background
+  match is a flat fill (seams on texture).
 - **`project.rs`** — save/resume. A `.expj` JSON file (`Project`) references the **source by
   path** (not the rendered pages — re-derived on load) and stores regions, the id counter,
   translations (`results`), page, and the source/target lang + backend. `project::open_document`
@@ -153,7 +180,11 @@ The design was chosen deliberately; don't silently swap these out.
   intended hardening.
 - **`fonts.rs`** — installs a bundled Noto Sans JP (`assets/fonts/`, OFL) as the last fallback
   for both font families, so Japanese/CJK source and translated text render instead of tofu.
-  Called once from `App::new` via `cc.egui_ctx`.
+  Called once from `App::new` via `cc.egui_ctx`. The bundled TTF is the **variable** font (weight
+  100–900) whose default instance is Thin; `weighted(bold)` returns an `ab_glyph::FontRef` with the
+  `wght` axis pinned to 400/700 for the export/preview rasterizer, so translated text isn't spindly
+  and bold is a real heavier weight (no second font file). egui's UI fallback still uses the Thin
+  default — only the rasterized translation text is weight-pinned.
 
 ## Native dependency gotchas
 

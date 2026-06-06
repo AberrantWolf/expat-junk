@@ -54,11 +54,82 @@ impl SourceMethod {
     }
 }
 
-/// A completed translation plus how its source text was obtained.
+/// Horizontal alignment for the overlaid translation text.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Justify {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// 90° rotation for the overlaid text. English documents use both conventions:
+/// `Cw` (reads top-to-bottom, head tilted right) is the margin/spine/label norm
+/// and the default when rotating; `Ccw` (reads bottom-to-top, head tilted left)
+/// is the chart axis-label norm.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Rotate {
+    #[default]
+    None,
+    /// Clockwise — text reads top-to-bottom.
+    Cw,
+    /// Counter-clockwise — text reads bottom-to-top.
+    Ccw,
+}
+
+impl Rotate {
+    /// Whether the text is turned on its side (so the render buffer's width and
+    /// height are swapped before it's rotated back to fill the region).
+    pub fn is_sideways(self) -> bool {
+        !matches!(self, Rotate::None)
+    }
+}
+
+/// Per-region presentation overrides the user can tweak after translating. These
+/// persist with the project and drive both the live preview and the export, so
+/// what you set here is what gets baked into the output.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RegionStyle {
+    /// User-edited replacement text. `None` means "use the machine translation"
+    /// (and keeps tracking it if the region is re-translated).
+    pub text: Option<String>,
+    /// Render the text rotated 90° (for vertical/sideways layouts).
+    pub rotate: Rotate,
+    /// Background fill override (sRGB). `None` auto-samples the page around the
+    /// region, matching the export's default background fill.
+    pub background: Option<[u8; 3]>,
+    pub justify: Justify,
+    /// Render the text in bold (700 weight) instead of regular (400).
+    #[serde(default)]
+    pub bold: bool,
+    /// Explicit font size in points. `None` auto-fits the largest size (up to the
+    /// region height) that fits the box; `Some` sets the starting size, still
+    /// shrunk to fit if the text would overflow.
+    #[serde(default)]
+    pub size_pt: Option<f32>,
+}
+
+/// A completed translation plus how its source text was obtained and any
+/// user presentation overrides.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Translated {
     pub result: TranslationResult,
     pub method: SourceMethod,
+    /// User tweaks to how the translation is rendered. `#[serde(default)]` keeps
+    /// projects saved before styling existed loadable.
+    #[serde(default)]
+    pub style: RegionStyle,
+}
+
+impl Translated {
+    /// The text to render: the user's edit if present, else the machine
+    /// translation.
+    pub fn display_text(&self) -> &str {
+        self.style
+            .text
+            .as_deref()
+            .unwrap_or(&self.result.translation)
+    }
 }
 
 /// An in-flight translation running on a background thread.
@@ -163,7 +234,12 @@ impl eframe::App for App {
         let mut clear_pending = false;
         if let Some(p) = pending.as_mut() {
             match p.rx.try_recv() {
-                Ok(Ok(translated)) => {
+                Ok(Ok(mut translated)) => {
+                    // Re-translating a region keeps the user's presentation
+                    // overrides (rotation, background, alignment, edited text).
+                    if let Some(prev) = results.get(&p.region) {
+                        translated.style = prev.style.clone();
+                    }
                     results.insert(p.region, translated);
                     *dirty = true;
                     clear_pending = true;
@@ -304,12 +380,12 @@ impl eframe::App for App {
         });
 
         // --- right panel: selected region info -------------------------------
-        info_panel(ui, document, results, pending, *selected);
+        info_panel(ui, document, results, pending, *selected, dirty);
 
         // --- central canvas --------------------------------------------------
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(doc) = document.as_mut() {
-                if viewer.show(ui, doc, current_page, selected) {
+                if viewer.show(ui, doc, current_page, selected, results) {
                     *dirty = true;
                 }
             } else {
@@ -494,23 +570,134 @@ impl eframe::App for App {
 fn info_panel(
     ui: &mut egui::Ui,
     document: &Option<Document>,
-    results: &HashMap<RegionId, Translated>,
+    results: &mut HashMap<RegionId, Translated>,
     pending: &Option<Pending>,
     selected: Option<RegionId>,
+    dirty: &mut bool,
 ) {
     egui::Panel::right("info").show_inside(ui, |ui| {
         ui.heading("Region");
         let translating = pending.as_ref().map(|p| p.region) == selected && pending.is_some();
         match selected {
             Some(id) if results.contains_key(&id) => {
-                let t = &results[&id];
+                let t = results.get_mut(&id).expect("checked by guard");
                 badge(ui, t.method);
                 ui.separator();
-                ui.label("Source");
-                ui.monospace(&t.result.source_text);
+
+                // Reference text: the source and the raw machine translation.
+                // Read-only but selectable, so the user can copy without editing.
+                reference_field(ui, "Source", &t.result.source_text);
+                reference_field(ui, "Machine translation", &t.result.translation);
                 ui.separator();
-                ui.label("Translation");
-                ui.monospace(&t.result.translation);
+
+                // 1. Editable text — defaults to the machine translation.
+                ui.label("Text (rendered on the page)");
+                let machine = t.result.translation.clone();
+                let mut text = t.style.text.clone().unwrap_or_else(|| machine.clone());
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.changed() {
+                    // Collapse back to "track the machine translation" if the user
+                    // typed it verbatim, so re-translation can update it.
+                    t.style.text = (text != machine).then_some(text);
+                    *dirty = true;
+                }
+                if t.style.text.is_some() && ui.small_button("Reset to machine translation").clicked()
+                {
+                    t.style.text = None;
+                    *dirty = true;
+                }
+                ui.separator();
+
+                // 2. Rotate 90° (clockwise = top-to-bottom; ccw = bottom-to-top).
+                ui.horizontal(|ui| {
+                    ui.label("Rotate");
+                    for (r, label, hover) in [
+                        (Rotate::None, "None", "Horizontal"),
+                        (Rotate::Cw, "↻ CW", "Clockwise — reads top-to-bottom (margin/label)"),
+                        (Rotate::Ccw, "↺ CCW", "Counter-clockwise — reads bottom-to-top (chart axis)"),
+                    ] {
+                        if ui
+                            .selectable_label(t.style.rotate == r, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            t.style.rotate = r;
+                            *dirty = true;
+                        }
+                    }
+                });
+
+                // 4. Left / Center / Right justify.
+                ui.horizontal(|ui| {
+                    ui.label("Align");
+                    for (j, label) in [
+                        (Justify::Left, "Left"),
+                        (Justify::Center, "Center"),
+                        (Justify::Right, "Right"),
+                    ] {
+                        if ui.selectable_label(t.style.justify == j, label).clicked() {
+                            t.style.justify = j;
+                            *dirty = true;
+                        }
+                    }
+                });
+
+                // Weight + font size. Size is optional: unset auto-fits the box.
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut t.style.bold, "Bold").changed() {
+                        *dirty = true;
+                    }
+                    ui.separator();
+                    let mut on = t.style.size_pt.is_some();
+                    if ui.checkbox(&mut on, "Font size").changed() {
+                        // Seed the override from the region height (a sane visible
+                        // default) so the field doesn't start at a jarring value.
+                        t.style.size_pt = on.then(|| {
+                            document
+                                .as_ref()
+                                .and_then(|d| d.regions.iter().find(|r| r.id == id))
+                                .map(|r| r.rect.h.min(48.0))
+                                .unwrap_or(16.0)
+                        });
+                        *dirty = true;
+                    }
+                    if let Some(size) = t.style.size_pt.as_mut() {
+                        if ui
+                            .add(
+                                egui::DragValue::new(size)
+                                    .speed(0.5)
+                                    .range(4.0..=400.0)
+                                    .suffix(" pt"),
+                            )
+                            .changed()
+                        {
+                            *dirty = true;
+                        }
+                    } else {
+                        ui.weak("(auto-fit)");
+                    }
+                });
+
+                // 3. Background color override.
+                ui.horizontal(|ui| {
+                    let mut on = t.style.background.is_some();
+                    if ui.checkbox(&mut on, "Override background").changed() {
+                        t.style.background = on.then_some([255, 255, 255]);
+                        *dirty = true;
+                    }
+                    if let Some(color) = t.style.background.as_mut() {
+                        if ui.color_edit_button_srgb(color).changed() {
+                            *dirty = true;
+                        }
+                    } else {
+                        ui.weak("(auto-matched to page)");
+                    }
+                });
+
                 if !t.result.alternatives.is_empty() {
                     ui.separator();
                     ui.label("Alternatives");
@@ -562,6 +749,18 @@ fn info_panel(
             }
         }
     });
+}
+
+/// A labelled, read-only-but-copyable text field (selectable label + a copy
+/// button). Used for the source text and the reference machine translation.
+fn reference_field(ui: &mut egui::Ui, label: &str, text: &str) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(text.to_owned());
+        }
+    });
+    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).selectable(true));
 }
 
 /// A small colored badge naming how the source text was/will be obtained.
@@ -789,7 +988,7 @@ fn run_translation(
         None => cache::key_pixels(provider, &model, &target_lang, &crop),
     };
     if let Some(result) = cache.lock().unwrap().get(&key) {
-        return Ok(Translated { result, method });
+        return Ok(Translated { result, method, style: RegionStyle::default() });
     }
 
     let req = TranslationRequest {
@@ -799,7 +998,7 @@ fn run_translation(
     };
     let result = translator.translate(&req)?;
     cache.lock().unwrap().insert(key, result.clone());
-    Ok(Translated { result, method })
+    Ok(Translated { result, method, style: RegionStyle::default() })
 }
 
 /// Provider id and model string used for cache keys.

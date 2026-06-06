@@ -22,7 +22,7 @@ use image::{Rgba, RgbaImage};
 use lopdf::{Dictionary, Object, Stream};
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, XObjectTransform};
 
-use crate::app::Translated;
+use crate::app::{Justify, Rotate, Translated};
 use crate::document::{Document, RegionId};
 
 const POINTS_PER_INCH: f32 = 72.0;
@@ -57,8 +57,8 @@ pub fn export_vector(
     results: &HashMap<RegionId, Translated>,
     out_path: &Path,
 ) -> Result<()> {
-    let font = FontRef::try_from_slice(crate::fonts::NOTO_SANS_JP)
-        .map_err(|e| anyhow::anyhow!("loading export font: {e}"))?;
+    let font = crate::fonts::weighted(false);
+    let font_bold = crate::fonts::weighted(true);
 
     let mut pdf = lopdf::Document::load(source_path)
         .with_context(|| format!("loading source PDF {}", source_path.display()))?;
@@ -83,9 +83,8 @@ pub fn export_vector(
                 w: (region.rect.w * scale_x).round() as i64,
                 h: (region.rect.h * scale_y).round() as i64,
             };
-            let bg = sample_background(&page.bitmap, px);
-            let (pw, ph, rgb) =
-                render_patch(region.rect.w, region.rect.h, bg, t.result.translation.trim(), &font);
+            let bg = effective_bg(t, || sample_background(&page.bitmap, px));
+            let (pw, ph, rgb) = render_patch(region.rect.w, region.rect.h, bg, t, &font, &font_bold);
 
             let img_id = add_image_xobject(&mut pdf, pw, ph, rgb);
             overlay_n += 1;
@@ -108,19 +107,60 @@ pub fn export_vector(
     Ok(())
 }
 
-/// Render a region's translated content (opaque background + text) to raw RGB at
-/// print resolution. Returns `(width, height, rgb_bytes)`.
+/// The background fill for a region: the user's override if set, else the
+/// auto-sampled page color (computed lazily, since sampling isn't free).
+fn effective_bg(t: &Translated, sample: impl FnOnce() -> Rgba<u8>) -> Rgba<u8> {
+    match t.style.background {
+        Some([r, g, b]) => Rgba([r, g, b, 255]),
+        None => sample(),
+    }
+}
+
+/// Render a region's translated content (opaque background + styled text) to raw
+/// RGB at print resolution. Returns `(width, height, rgb_bytes)`.
 fn render_patch(
     w_pts: f32,
     h_pts: f32,
     bg: Rgba<u8>,
-    text: &str,
-    font: &FontRef,
+    t: &Translated,
+    regular: &FontRef,
+    bold: &FontRef,
 ) -> (u32, u32, Vec<u8>) {
     const DPI: f32 = 200.0;
+    let px_per_pt = DPI / POINTS_PER_INCH;
     let pw = ((w_pts / POINTS_PER_INCH * DPI).round() as u32).max(1);
     let ph = ((h_pts / POINTS_PER_INCH * DPI).round() as u32).max(1);
-    let mut patch = RgbaImage::from_pixel(pw, ph, bg);
+    let patch = render_region_patch(pw, ph, bg, t, regular, bold, px_per_pt);
+
+    let mut rgb = Vec::with_capacity((patch.width() * patch.height() * 3) as usize);
+    for p in patch.pixels() {
+        rgb.extend_from_slice(&[p[0], p[1], p[2]]);
+    }
+    (patch.width(), patch.height(), rgb)
+}
+
+/// Render a `w_px`×`h_px` opaque patch: a flat background fill plus the region's
+/// styled translation (edited text, alignment, optional 90° rotation). This is
+/// the single source of truth shared by both export paths and the live preview,
+/// so what's previewed matches what's exported.
+pub(crate) fn render_region_patch(
+    w_px: u32,
+    h_px: u32,
+    bg: Rgba<u8>,
+    t: &Translated,
+    regular: &FontRef,
+    bold: &FontRef,
+    px_per_pt: f32,
+) -> RgbaImage {
+    let font = if t.style.bold { bold } else { regular };
+    // When rotating, lay the text out in a buffer with width/height swapped, then
+    // rotate it back so it fills the region.
+    let (bw, bh) = if t.style.rotate.is_sideways() {
+        (h_px.max(1), w_px.max(1))
+    } else {
+        (w_px.max(1), h_px.max(1))
+    };
+    let mut patch = RgbaImage::from_pixel(bw, bh, bg);
 
     let lum = 0.299 * bg[0] as f32 + 0.587 * bg[1] as f32 + 0.114 * bg[2] as f32;
     let color = if lum > 140.0 {
@@ -130,22 +170,22 @@ fn render_patch(
     };
     draw_text(
         &mut patch,
-        PixelRect {
-            x: 0,
-            y: 0,
-            w: pw as i64,
-            h: ph as i64,
-        },
-        text,
+        PixelRect { x: 0, y: 0, w: bw as i64, h: bh as i64 },
+        t.display_text().trim(),
         font,
         color,
+        t.style.justify,
+        t.style.size_pt,
+        px_per_pt,
     );
 
-    let mut rgb = Vec::with_capacity((pw * ph * 3) as usize);
-    for p in patch.pixels() {
-        rgb.extend_from_slice(&[p[0], p[1], p[2]]);
+    // `rotate90` is clockwise (text reads top-to-bottom), `rotate270` is
+    // counter-clockwise (bottom-to-top). Both swap dims back to (w_px, h_px).
+    match t.style.rotate {
+        Rotate::None => patch,
+        Rotate::Cw => image::imageops::rotate90(&patch),
+        Rotate::Ccw => image::imageops::rotate270(&patch),
     }
-    (pw, ph, rgb)
 }
 
 /// Build a FlateDecode-compressed DeviceRGB image XObject and add it to `pdf`.
@@ -169,8 +209,8 @@ pub fn export_raster(
     results: &HashMap<RegionId, Translated>,
     out_path: &Path,
 ) -> Result<()> {
-    let font = FontRef::try_from_slice(crate::fonts::NOTO_SANS_JP)
-        .map_err(|e| anyhow::anyhow!("loading export font: {e}"))?;
+    let font = crate::fonts::weighted(false);
+    let font_bold = crate::fonts::weighted(true);
 
     let mut pdf = PdfDocument::new("expat-junk translation");
     let mut pages = Vec::with_capacity(doc.pages.len());
@@ -190,7 +230,9 @@ pub fn export_raster(
                 w: (region.rect.w * scale_x).round() as i64,
                 h: (region.rect.h * scale_y).round() as i64,
             };
-            bake_region(&mut img, rect, t.result.translation.trim(), &font);
+            // Raster preserves the page aspect, so scale_x ≈ scale_y; use it as
+            // the px-per-point scale for converting any explicit font size.
+            bake_region(&mut img, rect, t, &font, &font_bold, scale_x);
         }
 
         let bitmap_w = img.width() as f32;
@@ -231,33 +273,39 @@ fn pt_to_mm(pt: f32) -> f32 {
 }
 
 #[derive(Clone, Copy)]
-struct PixelRect {
-    x: i64,
-    y: i64,
-    w: i64,
-    h: i64,
+pub(crate) struct PixelRect {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
 }
 
-/// Cover a region's source with the sampled background color, then draw the
-/// translated text on top.
-fn bake_region(img: &mut RgbaImage, rect: PixelRect, text: &str, font: &FontRef) {
+/// Render the region's styled translation patch and composite it (opaque) over
+/// the source at `rect`.
+fn bake_region(
+    img: &mut RgbaImage,
+    rect: PixelRect,
+    t: &Translated,
+    regular: &FontRef,
+    bold: &FontRef,
+    px_per_pt: f32,
+) {
     if rect.w <= 0 || rect.h <= 0 {
         return;
     }
-    let bg = sample_background(img, rect);
-    fill_rect(img, rect, bg);
-
-    let lum = 0.299 * bg[0] as f32 + 0.587 * bg[1] as f32 + 0.114 * bg[2] as f32;
-    let color = if lum > 140.0 {
-        Rgba([0, 0, 0, 255])
-    } else {
-        Rgba([255, 255, 255, 255])
-    };
-    draw_text(img, rect, text, font, color);
+    let bg = effective_bg(t, || sample_background(img, rect));
+    let patch = render_region_patch(rect.w as u32, rect.h as u32, bg, t, regular, bold, px_per_pt);
+    for (dx, dy, px) in patch.enumerate_pixels() {
+        let x = rect.x + dx as i64;
+        let y = rect.y + dy as i64;
+        if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
+            img.put_pixel(x as u32, y as u32, *px);
+        }
+    }
 }
 
 /// Average color of a 1px ring just outside the region (clamped to the image).
-fn sample_background(img: &RgbaImage, rect: PixelRect) -> Rgba<u8> {
+pub(crate) fn sample_background(img: &RgbaImage, rect: PixelRect) -> Rgba<u8> {
     let (iw, ih) = (img.width() as i64, img.height() as i64);
     let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
     let mut sample = |x: i64, y: i64| {
@@ -284,18 +332,18 @@ fn sample_background(img: &RgbaImage, rect: PixelRect) -> Rgba<u8> {
     }
 }
 
-fn fill_rect(img: &mut RgbaImage, rect: PixelRect, color: Rgba<u8>) {
-    let (iw, ih) = (img.width() as i64, img.height() as i64);
-    for y in rect.y.max(0)..(rect.y + rect.h).min(ih) {
-        for x in rect.x.max(0)..(rect.x + rect.w).min(iw) {
-            img.put_pixel(x as u32, y as u32, color);
-        }
-    }
-}
-
 /// Wrap `text` to the rect width at the largest size (capped) that fits the
-/// height, then rasterize it into the rect.
-fn draw_text(img: &mut RgbaImage, rect: PixelRect, text: &str, font: &FontRef, color: Rgba<u8>) {
+/// height, then rasterize it into the rect with the given horizontal alignment.
+fn draw_text(
+    img: &mut RgbaImage,
+    rect: PixelRect,
+    text: &str,
+    font: &FontRef,
+    color: Rgba<u8>,
+    justify: Justify,
+    size_pt: Option<f32>,
+    px_per_pt: f32,
+) {
     if text.is_empty() {
         return;
     }
@@ -303,7 +351,13 @@ fn draw_text(img: &mut RgbaImage, rect: PixelRect, text: &str, font: &FontRef, c
     let max_w = (rect.w as f32 - 2.0 * pad).max(1.0);
     let max_h = (rect.h as f32 - 2.0 * pad).max(1.0);
 
-    let mut size = max_h.min(48.0);
+    // Starting size, in buffer pixels: the user's explicit point size if set,
+    // else the region height (no fixed ceiling — big regions render big). Either
+    // way the loop below shrinks it until the wrapped text fits the box.
+    let mut size = match size_pt {
+        Some(pt) => (pt * px_per_pt).max(1.0),
+        None => max_h,
+    };
     let lines = loop {
         let lines = wrap_lines(text, font, size, max_w);
         let scaled = font.as_scaled(PxScale::from(size));
@@ -316,9 +370,17 @@ fn draw_text(img: &mut RgbaImage, rect: PixelRect, text: &str, font: &FontRef, c
 
     let scaled = font.as_scaled(PxScale::from(size));
     let line_h = scaled.height() + scaled.line_gap();
+    let measure = |s: &str| -> f32 { s.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum() };
     let mut baseline_y = rect.y as f32 + pad + scaled.ascent();
     for line in lines {
-        let mut pen_x = rect.x as f32 + pad;
+        // Offset the line's start by its width per the alignment.
+        let slack = (max_w - measure(&line)).max(0.0);
+        let indent = match justify {
+            Justify::Left => 0.0,
+            Justify::Center => slack / 2.0,
+            Justify::Right => slack,
+        };
+        let mut pen_x = rect.x as f32 + pad + indent;
         for ch in line.chars() {
             let id = font.glyph_id(ch);
             let glyph: Glyph = id.with_scale_and_position(PxScale::from(size), point(pen_x, baseline_y));
@@ -375,9 +437,55 @@ fn blend(px: &mut Rgba<u8>, color: Rgba<u8>, coverage: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{SourceMethod, Translated};
+    use crate::app::{Justify, RegionStyle, Rotate, SourceMethod, Translated};
     use crate::document::{Document, Rect};
     use crate::translate::TranslationResult;
+
+    fn styled(translation: &str, style: RegionStyle) -> Translated {
+        Translated {
+            result: TranslationResult {
+                source_text: "src".into(),
+                translation: translation.into(),
+                alternatives: Vec::new(),
+                explanation: None,
+            },
+            method: SourceMethod::TextLayer,
+            style,
+        }
+    }
+
+    #[test]
+    fn patch_honors_style_overrides() {
+        let font = crate::fonts::weighted(false);
+        let bold = crate::fonts::weighted(true);
+
+        // Edited text overrides the machine translation; background override is
+        // used verbatim; corners stay the background color (no glyph there).
+        let t = styled(
+            "machine",
+            RegionStyle {
+                text: Some("EDITED".into()),
+                background: Some([10, 20, 30]),
+                justify: Justify::Right,
+                rotate: Rotate::None,
+                bold: true,
+                size_pt: Some(12.0),
+            },
+        );
+        assert_eq!(t.display_text(), "EDITED");
+        let patch = render_region_patch(120, 40, Rgba([10, 20, 30, 255]), &t, &font, &bold, 2.0);
+        assert_eq!(patch.dimensions(), (120, 40));
+        assert_eq!(*patch.get_pixel(0, 0), Rgba([10, 20, 30, 255]));
+
+        // Rotation (either direction) lays text out swapped then rotates back to
+        // fill the region, so the returned patch still matches the region size.
+        for rotate in [Rotate::Cw, Rotate::Ccw] {
+            let rotated = styled("hello", RegionStyle { rotate, ..Default::default() });
+            let patch =
+                render_region_patch(120, 40, Rgba([255, 255, 255, 255]), &rotated, &font, &bold, 2.0);
+            assert_eq!(patch.dimensions(), (120, 40));
+        }
+    }
 
     #[test]
     fn exports_a_valid_pdf() {
@@ -413,6 +521,7 @@ mod tests {
                     explanation: None,
                 },
                 method: SourceMethod::TextLayer,
+                style: Default::default(),
             },
         );
 
@@ -519,6 +628,7 @@ mod vector_test {
                     explanation: None,
                 },
                 method: SourceMethod::TextLayer,
+                style: Default::default(),
             },
         );
 

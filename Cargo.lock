@@ -2066,7 +2066,10 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "junk-libs-egui-docview",
+ "junk-libs-egui-pdfdoc",
  "junk-libs-pdfium",
+ "junk-libs-raster",
  "keyring",
  "leptess",
  "lopdf 0.41.0",
@@ -3257,6 +3260,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "junk-libs-egui-docview"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "image",
+ "junk-libs-raster",
+ "serde",
+]
+
+[[package]]
+name = "junk-libs-egui-pdfdoc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "junk-libs-egui-docview",
+ "junk-libs-pdfium",
+ "serde",
+]
+
+[[package]]
 name = "junk-libs-pdfium"
 version = "0.1.0"
 dependencies = [
@@ -3266,6 +3290,13 @@ dependencies = [
  "pdfium-render",
  "tar",
  "ureq",
+]
+
+[[package]]
+name = "junk-libs-raster"
+version = "0.1.0"
+dependencies = [
+ "image",
 ]
 
 [[package]]

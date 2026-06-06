@@ -43,9 +43,10 @@ The design was chosen deliberately; don't silently swap these out.
 - **Only `src/app.rs` and `src/viewer.rs` touch egui.** Everything else (rendering, OCR,
   API calls, PDF generation) is GUI-agnostic backend code. Preserve this boundary — it's
   what keeps the egui-vs-anything-else decision reversible and the backend testable.
-  `viewer.rs` is deliberately self-contained (takes `&mut Document` + the selection, owns
-  only its texture and in-progress drag) so it can later be lifted into a shared
-  `junk-libs-egui-pdfview` widget. `app.rs`'s top panel is **just a menu bar**
+  The interactive page canvas was **lifted out** into the shared `junk-libs-egui-docview`
+  widget (`DocView`); `viewer.rs` is now just the host *adapter* that paints our
+  translations onto it (see its bullet below), which is why it still touches egui.
+  `app.rs`'s top panel is **just a menu bar**
   (File/Edit/Settings); all translation controls (language pickers, the Translate/Re-translate
   button, status/error) live in the **right `info_panel`**, so the bar above the document holds
   only the viewer's own page/zoom controls. Menu/shortcut/panel clicks are collected into an
@@ -69,56 +70,77 @@ The design was chosen deliberately; don't silently swap these out.
   `CharBox`es (via `fpdf_text` loose glyph bounds), flipping PDF's bottom-left coords into our
   top-left page space. `render_page_bitmap()` renders a single page at a given scale (px/pt),
   bitmap only — used by `Document::rerender_page` to re-render the current page crisply on zoom.
-  `quantize_zoom()` is currently unused. To change PDFium
-  versions, edit that crate (the `pdfium_NNNN` feature and `build.rs`'s `PDFIUM_VERSION`
-  together). The crate's render/text tests live with it; `tests/pdfium_wiring.rs` here only
-  guards that runtime binding survives being consumed as a dependency.
-- **`document.rs`** — `Document`/`Page`/`Region`. `Document::open()` dispatches on extension:
-  PDFs go through `pdfium::render_pdf`, images load via the `image` crate as a single page.
-  `Page::char_boxes` holds `(char, Rect)` from the text layer, for snap-to-text selection and
-  the native-text path. **`Rect` is in page coordinates (PDF points, top-left origin), never
-  screen pixels** — the UI converts using its zoom; `CharBox` is already flipped to match.
-  Regions carry a stable `RegionId` so UI state, cached translations, and export overlays all
-  refer to the same box across edits.
-- **`viewer.rs`** — the interactive page canvas, with its own control bar (zoom −/%/+, Fit
-  width, page ◀/▶). Renders the current page to an egui texture and lets the user draw / select
-  / move / resize / delete regions. All geometry stays in page points; the page↔screen transform
-  is derived each frame from the displayed image rect, so it's correct at any zoom. **Crisp
-  zoom:** each frame it computes a target render scale (`zoom × pixels_per_point`, quantized to
-  0.5 steps, clamped 1–6) and, when it differs from the current page bitmap's scale, calls
-  `Document::rerender_page` (→ `junk_libs_pdfium::render_page_bitmap`) so the raster matches the
-  on-screen size instead of being upscaled. The texture rebuilds when the page or its render
-  scale changes. Image sources can't re-render (raster), so they just display-scale. The
-  re-render is synchronous on the UI thread (a brief hitch per zoom quantum at high res); a
-  background-thread render would smooth that. The page lives in a `ScrollArea` whose content is
-  laid out at `max(page, viewport)` with the page **centered** in it (egui would otherwise
-  top-left-justify a page smaller than the view); the viewer **mirrors the scroll offset**
-  (`scroll_offset`, read back from the `ScrollAreaOutput` each frame). **Input model:**
-  **Ctrl+scroll / pinch** zooms (read via `i.zoom_delta()`, which egui keeps out of the scroll
-  delta so the `ScrollArea` doesn't also pan) — **toward an anchor**: buttons and scroll share one
-  `zoom_factor`, and the new offset `O' = f·O + (f−1)·(anchor − viewport.min)` is fed *into* the
-  `ScrollArea` via `.scroll_offset()` (set before content layout, so it lands the **same frame** —
-  no settle lag) to keep the anchor point fixed; the anchor is the cursor when over the view, else
-  the viewport center (zoom buttons / keyboard). `O'` is **pre-clamped** to the scroll range
-  `[0, max(0, page−viewport)]` per axis — an axis where the page fits pins to 0 (stays centered)
-  instead of being positioned at the raw offset and snapped back a frame later. **Middle-button drag** pans (grab-scroll via
-  `ui.scroll_with_delta`, gated by a `panning` flag so it never draws); the **primary button**
-  draws/moves/resizes regions
-  (the `_by(PointerButton::Primary)` response variants keep other buttons out of it). Drag start
-  uses `pointer.press_origin()` (not `interact_pointer_pos`, which is only sampled after the drag
-  threshold and offsets the start). A single hit-test, `hover_target` (corner handle → region
-  body → nothing), backs **both** `decide_drag` and the **hover highlight** (brighter outline on
-  the region/handle under the idle pointer, plus a resize/grab/crosshair cursor), so the
-  highlight always matches what a press will do. **Live translation
-  preview:** translated regions render their styled patch *over* the page via the **same**
-  `export::render_region_patch` the exporter uses (not an egui-native re-implementation), so the
-  preview is faithful to the output — including edited text, rotation, background override, and
-  alignment. Patches are rasterized at the page-bitmap scale, uploaded as per-region textures
-  cached by a `PatchKey` (text/rotate/bg/justify/size) and rebuilt only when that changes; the
-  cache is pruned to live regions each frame, and a control-bar "Translations" toggle hides the
-  overlay. **Deferred:** snapping region edges to `char_boxes`; lazy/bounded page-bitmap memory
-  (all pages still eager-render at `DEFAULT_RENDER_ZOOM`, and visited pages keep their last render
-  scale).
+  `quantize_zoom()` is currently unused. **Whole-render serialization:** `render_pdf` and
+  `render_page_bitmap` each hold a process-global `render_lock()` for their full duration. The
+  `thread_safe` crate feature only guards *individual* FFI calls, but a render is a *sequence*
+  (load → page → render → extract) over shared library state; letting two interleave corrupts it
+  and segfaults. The lock makes concurrent callers (e.g. parallel tests) safe at the cost of
+  render parallelism. To change PDFium versions, edit that crate (the `pdfium_NNNN` feature and
+  `build.rs`'s `PDFIUM_VERSION` together). The crate's render/text tests live with it;
+  `tests/pdfium_wiring.rs` here only guards that runtime binding survives being consumed as a dep.
+- **The PDF-view stack lives in three sibling `junk-libs` crates** (path deps), so the widget is
+  reusable (print-junk can adopt it) and the layers stay decoupled:
+  - **`junk-libs-egui-docview`** — the reusable, document-format-agnostic interactive widget
+    (`DocView`) plus the seam it's driven through: the `PageModel` trait (the host's document,
+    seen by the widget), the `RegionOverlay` trait + `OverlayCtx` (the host paints per-region
+    content), and the geometry types `Rect`/`RegionId`. **No pdfium, no ab_glyph** — pure egui.
+  - **`junk-libs-egui-pdfdoc`** — a batteries-included `PageModel`: `Document`/`Page`/`Region`
+    + PDF/image loading (PDFium / `image`), `crop`, `region_text`, `rerender_page`. This is the
+    layer that pulls in `junk-libs-pdfium`.
+  - **`junk-libs-raster`** — tiny `image`-only helper (`sample_background`, `PixelRect`) shared
+    by the widget's `OverlayCtx::sample_background` and our `export.rs` (so the GUI-agnostic
+    backend never links egui and the widget never links pdfium).
+- **`document.rs`** — now just **re-exports** `Document`/`Region` from `junk-libs-egui-pdfdoc` and
+  `Rect`/`RegionId` from `junk-libs-egui-docview`, so the rest of the app keeps saying
+  `crate::document::*`. `Document::open()` dispatches on extension (PDF → `pdfium::render_pdf`,
+  image → `image` crate as one page); `Page::char_boxes` holds `(char, Rect)` from the text layer
+  for snap-to-text selection and the native-text path. **`Rect` is in page coordinates (PDF
+  points, top-left origin), never screen pixels** — the UI converts using its zoom; `CharBox` is
+  flipped to match. A `Region` is **pure geometry** (`id`/`page`/`rect`); per-region application
+  data (translations) lives in the app, keyed by the stable `RegionId` (the old `marked_native`
+  flag was dead and was dropped — old `.expj` files still load, serde ignores the missing field).
+- **`junk-libs-egui-docview` widget (the canvas itself)** — `DocView` renders the current page to
+  an egui texture and lets the user draw / select / move / resize / delete regions, with its own
+  control bar (zoom −/%/+, Fit width, page ◀/▶, plus host-supplied buttons via an
+  `extra_controls` callback). It reads the document only through `PageModel` (`page_size`/
+  `page_bitmap`/`regions_on`/`region_rect_mut`/`add_region`/`remove_region`/`rerender_page`) and
+  asks the host's `RegionOverlay` to paint each region. All geometry stays in page points; the
+  page↔screen transform is derived each frame from the displayed image rect, so it's correct at
+  any zoom. **Crisp zoom:** each frame it computes a target render scale (`zoom × pixels_per_point`,
+  quantized to 0.5 steps, clamped 1–6) and, when it differs from the current page bitmap's scale,
+  calls `PageModel::rerender_page` (→ `junk_libs_pdfium::render_page_bitmap`) so the raster matches
+  the on-screen size instead of being upscaled. The texture rebuilds when the page or its render
+  scale changes. Image sources can't re-render (raster), so they just display-scale. The re-render
+  is synchronous on the UI thread (a brief hitch per zoom quantum at high res). The page lives in a
+  `ScrollArea` whose content is laid out at `max(page, viewport)` with the page **centered** in it
+  (egui would otherwise top-left-justify a page smaller than the view); the widget **mirrors the
+  scroll offset** (`scroll_offset`, read back from the `ScrollAreaOutput` each frame). **Input
+  model:** **Ctrl+scroll / pinch** zooms (read via `i.zoom_delta()`, which egui keeps out of the
+  scroll delta so the `ScrollArea` doesn't also pan) — **toward an anchor**: buttons and scroll
+  share one `zoom_factor`, and the new offset `O' = f·O + (f−1)·(anchor − viewport.min)` is fed
+  *into* the `ScrollArea` via `.scroll_offset()` (set before content layout, so it lands the **same
+  frame** — no settle lag) to keep the anchor fixed; the anchor is the cursor when over the view,
+  else the viewport center. `O'` is **pre-clamped** to the scroll range `[0, max(0, page−viewport)]`
+  per axis — an axis where the page fits pins to 0 (stays centered). **Middle-button drag** pans
+  (grab-scroll, gated by a `panning` flag so it never draws); the **primary button** draws/moves/
+  resizes regions (the `_by(PointerButton::Primary)` response variants keep other buttons out of
+  it). Drag start uses `pointer.press_origin()` (not `interact_pointer_pos`, which is only sampled
+  after the drag threshold and offsets the start). A single hit-test, `hover_target` (corner handle
+  → region body → nothing), backs **both** `decide_drag` and the **hover highlight**, so the
+  highlight always matches what a press will do. **Deferred:** snapping region edges to
+  `char_boxes`; lazy/bounded page-bitmap memory (all pages eager-render at `DEFAULT_RENDER_ZOOM`).
+- **`viewer.rs`** — the host **translation-overlay adapter** between the widget and our domain.
+  It owns `TranslationOverlay` (the bundled CJK fonts + the per-region rendered-patch cache),
+  exposes a per-frame `RegionOverlay` impl (`TranslationFrame`), and is the only place that knows
+  about `Translated`/styles. In `RegionOverlay::paint` it renders each translated region's styled
+  patch *over* the page via the **same** `export::render_region_patch` the exporter uses (not an
+  egui re-implementation), so the preview is faithful — edited text, rotation, bold, background
+  override, alignment, size. Patches are rasterized at the page-bitmap scale (background from
+  `style.background`, else `OverlayCtx::sample_background` — only sampled when there's no
+  override), uploaded as per-region textures cached by a `PatchKey` (text/rotate/bg/justify/bold/
+  size/w/h) and rebuilt only when that changes; `app.rs` prunes the cache to live results each
+  frame, and a control-bar "Translations" toggle (`show_translations`, owned by `app.rs` and fed
+  to the widget via `extra_controls`) hides the overlay.
 - **`translate.rs`** — one `Translator` trait, two impls:
   - `GeminiVision` (**default, implemented**): POSTs the region crop (PNG, base64) to Gemini's
     `generateContent` with a `responseSchema` that forces JSON, so we parse source text +
@@ -177,7 +199,9 @@ The design was chosen deliberately; don't silently swap these out.
   region's `RegionStyle`: the displayed text (`Translated::display_text` — edited or machine),
   `justify` (per-line offset in `draw_text`), `rotate` (a `Rotate` of `None`/`Cw`/`Ccw` — lay out in a
   swapped-dim buffer then `rotate90` for clockwise / `rotate270` for counter-clockwise), `background`
-  (override color, else `sample_background`'s flat fill), `bold` (picks the `bold` vs `regular` font),
+  (override color, else `junk_libs_raster::sample_background`'s flat fill — `sample_background` and
+  `PixelRect` moved to that shared crate so both this backend code and the widget overlay reuse one
+  copy), `bold` (picks the `bold` vs `regular` font),
   and `size_pt` (converted to buffer pixels via `px_per_pt` as `draw_text`'s starting size — `None`
   starts at the region height; either way `draw_text` shrinks to fit). The two fonts are
   weight-pinned instances of the one bundled variable font (`fonts::weighted(bold)`). Both are verified headless:

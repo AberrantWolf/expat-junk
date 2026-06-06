@@ -22,6 +22,8 @@ use image::{Rgba, RgbaImage};
 use lopdf::{Dictionary, Object, Stream};
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, XObjectTransform};
 
+use junk_libs_raster::{sample_background, PixelRect};
+
 use crate::app::{Justify, Rotate, Translated};
 use crate::document::{Document, RegionId};
 
@@ -272,14 +274,6 @@ fn pt_to_mm(pt: f32) -> f32 {
     pt / POINTS_PER_INCH * 25.4
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct PixelRect {
-    pub x: i64,
-    pub y: i64,
-    pub w: i64,
-    pub h: i64,
-}
-
 /// Render the region's styled translation patch and composite it (opaque) over
 /// the source at `rect`.
 fn bake_region(
@@ -301,34 +295,6 @@ fn bake_region(
         if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
             img.put_pixel(x as u32, y as u32, *px);
         }
-    }
-}
-
-/// Average color of a 1px ring just outside the region (clamped to the image).
-pub(crate) fn sample_background(img: &RgbaImage, rect: PixelRect) -> Rgba<u8> {
-    let (iw, ih) = (img.width() as i64, img.height() as i64);
-    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
-    let mut sample = |x: i64, y: i64| {
-        if x >= 0 && y >= 0 && x < iw && y < ih {
-            let p = img.get_pixel(x as u32, y as u32);
-            r += p[0] as u64;
-            g += p[1] as u64;
-            b += p[2] as u64;
-            n += 1;
-        }
-    };
-    for x in rect.x..rect.x + rect.w {
-        sample(x, rect.y - 1);
-        sample(x, rect.y + rect.h);
-    }
-    for y in rect.y..rect.y + rect.h {
-        sample(rect.x - 1, y);
-        sample(rect.x + rect.w, y);
-    }
-    if n == 0 {
-        Rgba([255, 255, 255, 255])
-    } else {
-        Rgba([(r / n) as u8, (g / n) as u8, (b / n) as u8, 255])
     }
 }
 

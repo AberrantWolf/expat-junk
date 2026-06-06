@@ -12,9 +12,16 @@ directories = "6.0.0"
 eframe = "0.34.3"
 egui = "0.34.3"
 image = "0.25.10"
-# PDFium render core (page rasterization + text-layer extraction) and its
-# binary vendoring live in the shared crate. See its CLAUDE.md note on version
-# pinning. Sibling-repo path dependency for local development.
+# Shared junk-libs crates (sibling-repo path deps for local development):
+# - egui-docview: the reusable interactive page-view widget (DocView + PageModel).
+# - egui-pdfdoc: the batteries-included PDFium-backed Document implementing PageModel.
+# - raster: GUI-agnostic page-bitmap helpers (sample_background), shared by the
+#   widget's overlay and our export code.
+# - pdfium: render core (still used directly by export.rs for vector export/tests).
+#   See its CLAUDE.md note on version pinning.
+junk-libs-egui-docview = { path = "../junk-libs/junk-libs-egui-docview" }
+junk-libs-egui-pdfdoc = { path = "../junk-libs/junk-libs-egui-pdfdoc" }
+junk-libs-raster = { path = "../junk-libs/junk-libs-raster" }
 junk-libs-pdfium = { path = "../junk-libs/junk-libs-pdfium" }
 keyring = "4.0.1"
 leptess = { version = "0.14.0", optional = true }

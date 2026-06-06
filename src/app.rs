@@ -3,8 +3,10 @@
 //! This module wires the UI together and owns the session: the open document and
 //! its source path, the current project file + dirty flag, the selection, cached
 //! translations, and the in-flight request. The page canvas is delegated to
-//! [`crate::viewer::Viewer`]. Menu/toolbar clicks are collected as an [`Action`]
-//! and executed after the panels render, which keeps borrows simple.
+//! the `junk-libs-egui-docview` widget ([`DocView`]), with translations painted
+//! over it by [`crate::viewer::TranslationOverlay`]. Menu/toolbar clicks are
+//! collected as an [`Action`] and executed after the panels render, which keeps
+//! borrows simple.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -22,7 +24,8 @@ use crate::secrets::Secrets;
 use crate::translate::{
     GeminiVision, TesseractText, TextApi, TranslationRequest, TranslationResult, Translator,
 };
-use crate::viewer::Viewer;
+use crate::viewer::TranslationOverlay;
+use junk_libs_egui_docview::DocView;
 
 /// How a region's source text was obtained — shown as a badge so the user knows
 /// what is being sent to translate.
@@ -173,7 +176,14 @@ pub struct App {
     /// a time through `pending`.
     queue: VecDeque<RegionId>,
     error: Option<String>,
-    viewer: Viewer,
+    /// The shared interactive page-view widget (zoom/pan/region editing).
+    doc_view: DocView,
+    /// Translation-overlay state (fonts + per-region patch cache) painted onto the
+    /// page by the widget.
+    overlay: TranslationOverlay,
+    /// Whether the translation overlay is shown over the page (toggled in the
+    /// viewer's control bar). Persists across document opens.
+    show_translations: bool,
     secrets: Secrets,
     show_settings: bool,
     api_key_input: String,
@@ -197,7 +207,9 @@ impl App {
             pending: None,
             queue: VecDeque::new(),
             error: None,
-            viewer: Viewer::default(),
+            doc_view: DocView::default(),
+            overlay: TranslationOverlay::default(),
+            show_translations: true,
             secrets: Secrets::load(),
             show_settings: false,
             api_key_input: String::new(),
@@ -223,7 +235,9 @@ impl eframe::App for App {
             pending,
             queue,
             error,
-            viewer,
+            doc_view,
+            overlay,
+            show_translations,
             secrets,
             show_settings,
             api_key_input,
@@ -346,7 +360,26 @@ impl eframe::App for App {
         // --- central canvas --------------------------------------------------
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(doc) = document.as_mut() {
-                if viewer.show(ui, doc, current_page, selected, results) {
+                let mut frame = overlay.frame(results, *show_translations);
+                let edited = doc_view.show(ui, doc, current_page, selected, &mut frame, |ui| {
+                    // Host control: the translation-overlay toggle, in the viewer bar.
+                    ui.separator();
+                    ui.add_enabled_ui(!results.is_empty(), |ui| {
+                        if ui
+                            .selectable_label(*show_translations, "Translations")
+                            .on_hover_text(
+                                "Overlay translated text on the page (preview of the export)",
+                            )
+                            .clicked()
+                        {
+                            *show_translations = !*show_translations;
+                        }
+                    });
+                });
+                // `frame`'s borrow of `overlay` ends here (last used above), so we
+                // can prune the patch cache for regions whose translations are gone.
+                overlay.prune(results);
+                if edited {
                     *dirty = true;
                 }
             } else {
@@ -392,7 +425,8 @@ impl eframe::App for App {
                             *error = None;
                             *pending = None;
                             *dirty = false;
-                            viewer.reset();
+                            doc_view.reset();
+                            overlay.reset();
                         }
                         Err(e) => *error = Some(format!("{e:#}")),
                     }
@@ -421,7 +455,8 @@ impl eframe::App for App {
                             *error = None;
                             *pending = None;
                             *dirty = false;
-                            viewer.reset();
+                            doc_view.reset();
+                            overlay.reset();
                         }
                         Err(e) => *error = Some(format!("{e:#}")),
                     }

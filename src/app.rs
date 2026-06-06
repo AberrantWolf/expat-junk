@@ -412,7 +412,7 @@ impl eframe::App for App {
                         if path.extension().is_none() {
                             path.set_extension("pdf");
                         }
-                        match export::export_pdf(doc, results, &path) {
+                        match export::export(doc, src, results, &path) {
                             Ok(()) => *error = None,
                             Err(e) => *error = Some(format!("{e:#}")),
                         }

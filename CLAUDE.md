@@ -118,15 +118,18 @@ The design was chosen deliberately; don't silently swap these out.
   is the fallback when there's no source text at all. `Document::region_text` pulls text from
   `char_boxes` (chars whose box overlaps the region by ≥`CHAR_COVERAGE_THRESHOLD` — loose, since
   users draw imprecisely); OCR fills the same role for no-text-layer pages.
-- **`export.rs`** — **overlay on the rendered raster → PDF** (implemented). For each translated
-  region: sample the background (1px ring around it) → fill a flat cover rectangle → draw the
-  translation wrapped and auto-sized with `ab_glyph` + the bundled CJK font (so Japanese exports
-  correctly). Each annotated page raster is embedded full-size into a `printpdf` page (the
-  `images` feature; `from_dynamic_image` from raw RGBA → `Op::UseXobject` at a DPI that fills the
-  page). One multi-page PDF out. Trade-offs: everything becomes raster (vector text not retained),
-  flat fill seams on textured backgrounds — accepted per "no loss if we can't". Orientation is
-  verified upright by a headless test (export → re-render → check a top-left marker).
-  `lopdf` is still a dep but unused here (a future vector-overlay path could keep original text).
+- **`export.rs`** — translated-PDF export, dispatched by source type in `export()`:
+  - **PDF → vector-preserving** (`export_vector`): load the original with `lopdf`; for each
+    translated region add an opaque `Image` XObject (background-matched fill + wrapped/auto-sized
+    text via `ab_glyph` + the bundled CJK font) via `add_xobject` + `add_page_contents`, placed
+    with a `cm`/`Do` and a top-left→bottom-left y-flip. **The original page's vector text/graphics
+    stay untouched** — only the covered regions become raster. Assumes zero-origin `MediaBox`, no
+    `/Rotate` (the common case).
+  - **Image → full raster** (`export_raster`): bake cover boxes + text onto the page raster and
+    embed each page via `printpdf` (the `images` feature; `from_dynamic_image` → `Op::UseXobject`
+    at a page-filling DPI).
+  Both are verified headless: valid PDF + upright orientation (raster), and overlay-placed-upright
+  + valid + page-count-preserved (vector). Background match is a flat fill (seams on texture).
 - **`project.rs`** — save/resume. A `.expj` JSON file (`Project`) references the **source by
   path** (not the rendered pages — re-derived on load) and stores regions, the id counter,
   translations (`results`), page, and the source/target lang + backend. `project::open_document`

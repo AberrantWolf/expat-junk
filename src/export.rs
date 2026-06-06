@@ -1,12 +1,17 @@
-//! Export: bake translated regions onto the rendered pages and write a PDF.
+//! Export: write a translated PDF.
 //!
-//! Strategy (v1): **overlay on the rendered raster.** For each translated region
-//! we sample the surrounding background color, paint a cover rectangle over the
-//! source, and draw the translated text on top — wrapped and auto-sized, using
-//! the bundled CJK-capable font. Each annotated page is embedded full-size into a
-//! PDF page. Untranslated content is preserved as the original raster; vector
-//! text is not retained (acceptable per "no loss if we can't"). Background
-//! matching is a flat fill, so photo/textured backgrounds will show a seam.
+//! Two strategies, chosen by source type in [`export`]:
+//! - **Vector-preserving** ([`export_vector`], PDF sources): load the original
+//!   with `lopdf` and overlay each translated region as an opaque image patch
+//!   (background-matched fill + the translated text). The original page's vector
+//!   text/graphics stay untouched — only the covered source regions become
+//!   raster. Default for PDFs.
+//! - **Full raster** ([`export_raster`], image sources): bake the cover boxes +
+//!   text onto the page raster and embed each page full-size via `printpdf`.
+//!
+//! Both render the translation with `ab_glyph` + the bundled CJK font (so
+//! Japanese exports correctly), wrapped and auto-sized. Background matching is a
+//! flat fill, so photo/textured backgrounds show a seam ("no loss if we can't").
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +19,7 @@ use std::path::Path;
 use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
+use lopdf::{Dictionary, Object, Stream};
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, XObjectTransform};
 
 use crate::app::Translated;
@@ -21,8 +27,144 @@ use crate::document::{Document, RegionId};
 
 const POINTS_PER_INCH: f32 = 72.0;
 
-/// Bake translations onto each page and write a multi-page PDF to `out_path`.
-pub fn export_pdf(
+/// Export to `out_path`. For PDF sources this **preserves the original vector
+/// content** and overlays only the translated regions (so untranslated text
+/// stays sharp and selectable); image sources fall back to a full-raster PDF.
+pub fn export(
+    doc: &Document,
+    source_path: &Path,
+    results: &HashMap<RegionId, Translated>,
+    out_path: &Path,
+) -> Result<()> {
+    let is_pdf = source_path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if is_pdf {
+        export_vector(doc, source_path, results, out_path)
+    } else {
+        export_raster(doc, results, out_path)
+    }
+}
+
+/// Overlay translated regions onto the original PDF, keeping its vector content.
+/// Each region becomes an opaque image patch (background-matched fill + the
+/// translated text) placed over the source. Assumes a zero-origin `MediaBox` and
+/// no `/Rotate` (the common case); rotated or offset pages would misplace
+/// overlays.
+pub fn export_vector(
+    doc: &Document,
+    source_path: &Path,
+    results: &HashMap<RegionId, Translated>,
+    out_path: &Path,
+) -> Result<()> {
+    let font = FontRef::try_from_slice(crate::fonts::NOTO_SANS_JP)
+        .map_err(|e| anyhow::anyhow!("loading export font: {e}"))?;
+
+    let mut pdf = lopdf::Document::load(source_path)
+        .with_context(|| format!("loading source PDF {}", source_path.display()))?;
+    let page_ids: Vec<lopdf::ObjectId> = pdf.get_pages().into_values().collect();
+
+    let mut overlay_n = 0u32;
+    for (page_index, page) in doc.pages.iter().enumerate() {
+        let Some(&page_id) = page_ids.get(page_index) else {
+            continue;
+        };
+        let page_h = page.size.1;
+        let scale_x = page.bitmap.width() as f32 / page.size.0;
+        let scale_y = page.bitmap.height() as f32 / page.size.1;
+
+        for region in doc.regions.iter().filter(|r| r.page == page_index) {
+            let Some(t) = results.get(&region.id) else {
+                continue;
+            };
+            let px = PixelRect {
+                x: (region.rect.x * scale_x).round() as i64,
+                y: (region.rect.y * scale_y).round() as i64,
+                w: (region.rect.w * scale_x).round() as i64,
+                h: (region.rect.h * scale_y).round() as i64,
+            };
+            let bg = sample_background(&page.bitmap, px);
+            let (pw, ph, rgb) =
+                render_patch(region.rect.w, region.rect.h, bg, t.result.translation.trim(), &font);
+
+            let img_id = add_image_xobject(&mut pdf, pw, ph, rgb);
+            overlay_n += 1;
+            let name = format!("XjTr{overlay_n}");
+            pdf.add_xobject(page_id, name.clone().into_bytes(), img_id)
+                .with_context(|| format!("adding overlay to page {page_index}"))?;
+
+            // Place the patch at the region, converting top-left to PDF bottom-left.
+            let x = region.rect.x;
+            let y = page_h - region.rect.y - region.rect.h;
+            let (w, h) = (region.rect.w, region.rect.h);
+            let ops = format!("q {w:.3} 0 0 {h:.3} {x:.3} {y:.3} cm /{name} Do Q\n");
+            pdf.add_page_contents(page_id, ops.into_bytes())
+                .with_context(|| format!("drawing overlay on page {page_index}"))?;
+        }
+    }
+
+    pdf.save(out_path)
+        .with_context(|| format!("writing {}", out_path.display()))?;
+    Ok(())
+}
+
+/// Render a region's translated content (opaque background + text) to raw RGB at
+/// print resolution. Returns `(width, height, rgb_bytes)`.
+fn render_patch(
+    w_pts: f32,
+    h_pts: f32,
+    bg: Rgba<u8>,
+    text: &str,
+    font: &FontRef,
+) -> (u32, u32, Vec<u8>) {
+    const DPI: f32 = 200.0;
+    let pw = ((w_pts / POINTS_PER_INCH * DPI).round() as u32).max(1);
+    let ph = ((h_pts / POINTS_PER_INCH * DPI).round() as u32).max(1);
+    let mut patch = RgbaImage::from_pixel(pw, ph, bg);
+
+    let lum = 0.299 * bg[0] as f32 + 0.587 * bg[1] as f32 + 0.114 * bg[2] as f32;
+    let color = if lum > 140.0 {
+        Rgba([0, 0, 0, 255])
+    } else {
+        Rgba([255, 255, 255, 255])
+    };
+    draw_text(
+        &mut patch,
+        PixelRect {
+            x: 0,
+            y: 0,
+            w: pw as i64,
+            h: ph as i64,
+        },
+        text,
+        font,
+        color,
+    );
+
+    let mut rgb = Vec::with_capacity((pw * ph * 3) as usize);
+    for p in patch.pixels() {
+        rgb.extend_from_slice(&[p[0], p[1], p[2]]);
+    }
+    (pw, ph, rgb)
+}
+
+/// Build a FlateDecode-compressed DeviceRGB image XObject and add it to `pdf`.
+fn add_image_xobject(pdf: &mut lopdf::Document, w: u32, h: u32, rgb: Vec<u8>) -> lopdf::ObjectId {
+    let mut dict = Dictionary::new();
+    dict.set("Type", Object::Name(b"XObject".to_vec()));
+    dict.set("Subtype", Object::Name(b"Image".to_vec()));
+    dict.set("Width", Object::Integer(w as i64));
+    dict.set("Height", Object::Integer(h as i64));
+    dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+    dict.set("BitsPerComponent", Object::Integer(8));
+    let mut stream = Stream::new(dict, rgb);
+    let _ = stream.compress();
+    pdf.add_object(stream)
+}
+
+/// Bake translations onto each page raster and write a full-raster multi-page PDF
+/// — used for image sources, which have no vector content to preserve.
+pub fn export_raster(
     doc: &Document,
     results: &HashMap<RegionId, Translated>,
     out_path: &Path,
@@ -275,7 +417,7 @@ mod tests {
         );
 
         let out = std::env::temp_dir().join("expat-junk-export-out.pdf");
-        export_pdf(&doc, &results, &out).expect("export");
+        export_raster(&doc, &results, &out).expect("export");
         let written = std::fs::read(&out).expect("read output");
         assert!(written.starts_with(b"%PDF"), "output is not a PDF");
         assert!(written.len() > 1000, "output suspiciously small: {}", written.len());
@@ -312,7 +454,7 @@ mod orientation_test {
         }
 
         let out = std::env::temp_dir().join("expat-junk-orient-out.pdf");
-        export_pdf(&doc, &HashMap::new(), &out).unwrap();
+        export_raster(&doc, &HashMap::new(), &out).unwrap();
 
         // Re-render the exported PDF and confirm the marker is still at the top.
         let pdfium = junk_libs_pdfium::instance().unwrap();
@@ -330,6 +472,88 @@ mod orientation_test {
             !(bottom_left[0] > 150 && bottom_left[1] < 100),
             "bottom-left is red — export is vertically flipped: {bottom_left:?}"
         );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+    }
+}
+
+#[cfg(test)]
+mod vector_test {
+    use super::*;
+    use crate::app::{SourceMethod, Translated};
+    use crate::document::{Document, Rect};
+    use crate::translate::TranslationResult;
+
+    #[test]
+    fn vector_export_overlays_and_stays_valid() {
+        let src = std::env::temp_dir().join("expat-junk-vec-src.pdf");
+        let bytes = printpdf::PdfDocument::new("src")
+            .with_pages(vec![printpdf::PdfPage::new(
+                printpdf::Mm(210.0),
+                printpdf::Mm(297.0),
+                Vec::new(),
+            )])
+            .save(&printpdf::PdfSaveOptions::default(), &mut Vec::new());
+        std::fs::write(&src, bytes).unwrap();
+
+        let mut doc = Document::open(&src).unwrap();
+        // A region near the top of the page (y small = near top).
+        let id = doc.add_region(
+            0,
+            Rect {
+                x: 60.0,
+                y: 60.0,
+                w: 240.0,
+                h: 40.0,
+            },
+        );
+        let mut results = HashMap::new();
+        results.insert(
+            id,
+            Translated {
+                result: TranslationResult {
+                    source_text: "こんにちは".to_string(),
+                    translation: "Hello world overlay text".to_string(),
+                    alternatives: Vec::new(),
+                    explanation: None,
+                },
+                method: SourceMethod::TextLayer,
+            },
+        );
+
+        let out = std::env::temp_dir().join("expat-junk-vec-out.pdf");
+        export_vector(&doc, &src, &results, &out).expect("vector export");
+
+        // Valid PDF, re-loadable, page count preserved.
+        assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
+        assert_eq!(lopdf::Document::load(&out).unwrap().get_pages().len(), 1);
+
+        // Re-render and confirm the overlay (black text on white) landed near the
+        // TOP, not flipped to the bottom.
+        let pdfium = junk_libs_pdfium::instance().unwrap();
+        let rendered = junk_libs_pdfium::render_pdf(pdfium, &out, 1.0).unwrap();
+        let img = &rendered[0].image;
+        let sx = img.width() as f32 / 595.0;
+        let sy = img.height() as f32 / 842.0;
+        let dark = |x0: f32, y0: f32, w: f32, h: f32| {
+            let mut n = 0;
+            for y in (y0 * sy) as u32..((y0 + h) * sy) as u32 {
+                for x in (x0 * sx) as u32..((x0 + w) * sx) as u32 {
+                    if x < img.width() && y < img.height() {
+                        let p = img.get_pixel(x, y);
+                        if p[0] < 100 && p[1] < 100 && p[2] < 100 {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            n
+        };
+        let top = dark(60.0, 60.0, 240.0, 40.0);
+        let bottom = dark(60.0, 842.0 - 100.0, 240.0, 40.0);
+        assert!(top > 0, "no overlay text rendered in the region");
+        assert!(top > bottom, "overlay appears flipped (top={top}, bottom={bottom})");
 
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&out);

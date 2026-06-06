@@ -73,9 +73,10 @@ Japanese and other CJK text renders via a bundled Noto Sans JP font.
   Open project** restores a session. The title bar shows a `*` when there are unsaved changes.
   Shortcuts: `Ctrl/Cmd+S` save, `Ctrl/Cmd+O` open document, `Ctrl/Cmd+E` export.
 - **Export:** **File → Export translated…** writes a PDF where each translated region is covered
-  with a background-matched box and the translation is drawn on top (CJK included). Untranslated
-  content is kept as-is. It's a raster overlay, so it doesn't retain the original's vector text —
-  good enough to read and share; a vector-preserving export is a future improvement.
+  with a background-matched box and the translation is drawn on top (CJK included). For **PDF
+  sources the original vector content is preserved** — untranslated text stays sharp and
+  selectable, and only the translated regions are overlaid. Image sources export as a full-page
+  raster. (Background matching is a flat fill, so textured/photo backgrounds may show a seam.)
 
 ## Optional: local OCR (Tesseract)
 

@@ -45,10 +45,12 @@ The design was chosen deliberately; don't silently swap these out.
   what keeps the egui-vs-anything-else decision reversible and the backend testable.
   `viewer.rs` is deliberately self-contained (takes `&mut Document` + the selection, owns
   only its texture and in-progress drag) so it can later be lifted into a shared
-  `junk-libs-egui-pdfview` widget. `app.rs` has a **menu bar** (File/Edit/Settings) over a
-  toolbar; menu/shortcut clicks are collected into an `Action` enum and executed *after* the
-  panels render — this sidesteps borrow conflicts between the menu closures and the field-level
-  `&mut` borrows the panels need.
+  `junk-libs-egui-pdfview` widget. `app.rs`'s top panel is **just a menu bar**
+  (File/Edit/Settings); all translation controls (language pickers, the Translate/Re-translate
+  button, status/error) live in the **right `info_panel`**, so the bar above the document holds
+  only the viewer's own page/zoom controls. Menu/shortcut/panel clicks are collected into an
+  `Action` enum (the panels return one) and executed *after* the panels render — this sidesteps
+  borrow conflicts between the menu closures and the field-level `&mut` borrows the panels need.
 - **eframe 0.34 API note:** the `App` trait method is `fn ui(&mut self, ui: &mut egui::Ui,
   …)` (not the older `update(&mut self, ctx, …)`), and panels use `.show_inside(ui, …)`
   (not `.show(ctx, …)`). Match this when adding UI.
@@ -86,10 +88,28 @@ The design was chosen deliberately; don't silently swap these out.
   0.5 steps, clamped 1–6) and, when it differs from the current page bitmap's scale, calls
   `Document::rerender_page` (→ `junk_libs_pdfium::render_page_bitmap`) so the raster matches the
   on-screen size instead of being upscaled. The texture rebuilds when the page or its render
-  scale changes. Image sources can't re-render (raster), so they just display-scale. Drag start
+  scale changes. Image sources can't re-render (raster), so they just display-scale. The
+  re-render is synchronous on the UI thread (a brief hitch per zoom quantum at high res); a
+  background-thread render would smooth that. The page lives in a `ScrollArea` whose content is
+  laid out at `max(page, viewport)` with the page **centered** in it (egui would otherwise
+  top-left-justify a page smaller than the view); the viewer **mirrors the scroll offset**
+  (`scroll_offset`, read back from the `ScrollAreaOutput` each frame). **Input model:**
+  **Ctrl+scroll / pinch** zooms (read via `i.zoom_delta()`, which egui keeps out of the scroll
+  delta so the `ScrollArea` doesn't also pan) — **toward an anchor**: buttons and scroll share one
+  `zoom_factor`, and the new offset `O' = f·O + (f−1)·(anchor − viewport.min)` is fed *into* the
+  `ScrollArea` via `.scroll_offset()` (set before content layout, so it lands the **same frame** —
+  no settle lag) to keep the anchor point fixed; the anchor is the cursor when over the view, else
+  the viewport center (zoom buttons / keyboard). `O'` is **pre-clamped** to the scroll range
+  `[0, max(0, page−viewport)]` per axis — an axis where the page fits pins to 0 (stays centered)
+  instead of being positioned at the raw offset and snapped back a frame later. **Middle-button drag** pans (grab-scroll via
+  `ui.scroll_with_delta`, gated by a `panning` flag so it never draws); the **primary button**
+  draws/moves/resizes regions
+  (the `_by(PointerButton::Primary)` response variants keep other buttons out of it). Drag start
   uses `pointer.press_origin()` (not `interact_pointer_pos`, which is only sampled after the drag
-  threshold and offsets the start). The re-render is synchronous on the UI thread (a brief hitch
-  per zoom quantum at high res); a background-thread render would smooth that. **Live translation
+  threshold and offsets the start). A single hit-test, `hover_target` (corner handle → region
+  body → nothing), backs **both** `decide_drag` and the **hover highlight** (brighter outline on
+  the region/handle under the idle pointer, plus a resize/grab/crosshair cursor), so the
+  highlight always matches what a press will do. **Live translation
   preview:** translated regions render their styled patch *over* the page via the **same**
   `export::render_region_patch` the exporter uses (not an egui-native re-implementation), so the
   preview is faithful to the output — including edited text, rotation, background override, and
@@ -170,8 +190,9 @@ The design was chosen deliberately; don't silently swap these out.
   reopens the source and re-applies the regions. `app.rs` tracks `source_path`/`project_path`/
   `dirty`; the window title reflects the file + a `*` when dirty.
 - **`config.rs`** — non-secret `Settings` (`load`/`save` as JSON under the platform config dir
-  via `directories`). `source_lang` (OCR, Tesseract code) and `target_lang` are editable inline
-  in the toolbar and persisted on change. `config::load_api_key(secrets, backend)` resolves the
+  via `directories`). `source_lang` (OCR, Tesseract code) and `target_lang` (ISO code) are picked
+  from dropdowns in the right panel (backed by the curated `LANGUAGES` table, which pairs each
+  language's `ocr`/`iso` codes) and persisted on change. `config::load_api_key(secrets, backend)` resolves the
   key: `EXPAT_JUNK_API_KEY` env overrides, else the secrets store. `Backend::secret_id()` names
   the credential per provider (`gemini`/`google`/`deepl`/`kagi`).
 - **`secrets.rs`** — API keys in `secrets.json` (config dir, owner-only on Unix), **separate**

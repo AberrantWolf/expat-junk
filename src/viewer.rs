@@ -29,6 +29,8 @@ const REGION_STROKE: Color32 = Color32::from_rgb(0xff, 0xa5, 0x00);
 const REGION_FILL: Color32 = Color32::from_rgba_premultiplied(0x30, 0x20, 0x00, 0x20);
 const ACCENT: Color32 = Color32::from_rgb(0x4e, 0x9a, 0xff);
 const ACCENT_FILL: Color32 = Color32::from_rgba_premultiplied(0x12, 0x25, 0x40, 0x30);
+/// Highlight for the region/handle the idle pointer is over.
+const HOVER: Color32 = Color32::from_rgb(0xff, 0xcc, 0x66);
 
 /// What the pointer is doing between press and release. Coordinates are in page
 /// points.
@@ -42,6 +44,19 @@ enum Drag {
     Moving { id: RegionId, grab: Vec2 },
     /// Resizing a region; `fixed` is the opposite corner that stays put.
     Resizing { id: RegionId, fixed: Pos2 },
+}
+
+/// What the pointer is hovering over when idle — drives the highlight + cursor so
+/// the user can tell a click will grab a widget rather than draw a new region. It
+/// is the same hit-test [`decide_drag`] uses, so the highlight matches the action.
+#[derive(Clone, Copy, PartialEq)]
+enum Hover {
+    None,
+    /// Over a region body (a press would move it).
+    Body(RegionId),
+    /// Over a corner of the selected region (a press would resize it). The index
+    /// is the corner: 0=TL, 1=TR, 2=BL, 3=BR.
+    Handle(RegionId, usize),
 }
 
 pub struct Viewer {
@@ -68,6 +83,11 @@ pub struct Viewer {
     /// when a region's text/style/size changes.
     patches: HashMap<RegionId, CachedPatch>,
     drag: Drag,
+    /// Middle-button panning in progress (drag-scrolls the view, never draws).
+    panning: bool,
+    /// Last frame's scroll offset, mirrored from the `ScrollArea` so we can drive
+    /// it directly when zooming (to anchor the zoom the same frame, no settle lag).
+    scroll_offset: Vec2,
 }
 
 /// One region's rendered translation patch plus the inputs it was built from, so
@@ -102,6 +122,8 @@ impl Default for Viewer {
             font_bold: crate::fonts::weighted(true),
             patches: HashMap::new(),
             drag: Drag::Idle,
+            panning: false,
+            scroll_offset: Vec2::ZERO,
         }
     }
 }
@@ -113,6 +135,8 @@ impl Viewer {
         self.texture_scale = 0.0;
         self.patches.clear();
         self.drag = Drag::Idle;
+        self.panning = false;
+        self.scroll_offset = Vec2::ZERO;
         self.fit = true;
         self.zoom = 1.0;
     }
@@ -131,15 +155,24 @@ impl Viewer {
         let total_pages = doc.pages.len();
         let mut edited = false;
 
+        // Accumulates this frame's zoom change (from buttons and/or Ctrl+scroll) as
+        // a single ratio, applied below to keep a fixed point (cursor or viewport
+        // center) pinned while zooming.
+        let mut zoom_factor = 1.0;
+
         // --- control bar: zoom + page navigation ---------------------------
         ui.horizontal(|ui| {
             if ui.button("−").on_hover_text("Zoom out").clicked() {
-                self.zoom = (self.zoom / ZOOM_STEP).max(MIN_ZOOM);
+                let new = (self.zoom / ZOOM_STEP).max(MIN_ZOOM);
+                zoom_factor *= new / self.zoom;
+                self.zoom = new;
                 self.fit = false;
             }
             ui.label(format!("{:.0}%", self.zoom * 100.0));
             if ui.button("+").on_hover_text("Zoom in").clicked() {
-                self.zoom = (self.zoom * ZOOM_STEP).min(MAX_ZOOM);
+                let new = (self.zoom * ZOOM_STEP).min(MAX_ZOOM);
+                zoom_factor *= new / self.zoom;
+                self.zoom = new;
                 self.fit = false;
             }
             if ui.selectable_label(self.fit, "Fit width").clicked() {
@@ -186,16 +219,15 @@ impl Viewer {
         if self.fit && page_size.x > 0.0 {
             self.zoom = (ui.available_width() / page_size.x).clamp(MIN_ZOOM, MAX_ZOOM);
         }
-        let cmd_scroll = ui.input(|i| {
-            if i.modifiers.command {
-                i.smooth_scroll_delta.y
-            } else {
-                0.0
-            }
-        });
-        if cmd_scroll.abs() > 0.1 {
-            self.zoom = (self.zoom * (1.0 + cmd_scroll * 0.0015)).clamp(MIN_ZOOM, MAX_ZOOM);
+        // Ctrl+scroll (and trackpad pinch) zooms. egui routes the ctrl-modified
+        // wheel into `zoom_delta` (a multiplicative factor) and keeps it out of the
+        // scroll delta, so the ScrollArea below won't also pan — read it directly.
+        let zoom_delta = ui.input(|i| i.zoom_delta());
+        if (zoom_delta - 1.0).abs() > f32::EPSILON {
+            let old = self.zoom;
+            self.zoom = (self.zoom * zoom_delta).clamp(MIN_ZOOM, MAX_ZOOM);
             self.fit = false;
+            zoom_factor *= self.zoom / old;
         }
 
         // Re-render the current page so its raster matches the on-screen size
@@ -230,13 +262,50 @@ impl Viewer {
 
         let display = page_size * self.zoom;
 
-        egui::ScrollArea::both().show(ui, |ui| {
-            let resp = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(tex_id, display))
-                    .fit_to_exact_size(display)
-                    .sense(Sense::click_and_drag()),
+        // Zoom keeps a fixed anchor pinned. Rather than nudging the offset *after*
+        // layout (which lands a frame late and visibly drifts into place), we drive
+        // the `ScrollArea` offset directly so the page is in its final position the
+        // same frame. The anchor is the cursor when it's over the view (Ctrl+scroll),
+        // else the view's center (zoom buttons / keyboard). With `O` the old offset
+        // and `f` the zoom ratio, `O' = f·O + (f−1)·(anchor − viewport.min)` keeps
+        // the page-point under the anchor fixed.
+        let viewport = ui.available_rect_before_wrap();
+        let forced_offset = ((zoom_factor - 1.0).abs() > f32::EPSILON).then(|| {
+            let anchor = ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| viewport.contains(*p))
+                .unwrap_or_else(|| viewport.center());
+            let target =
+                self.scroll_offset * zoom_factor + (anchor - viewport.min) * (zoom_factor - 1.0);
+            // Clamp to the real scroll range. A dimension where the page *fits* has
+            // an empty range, so its offset pins to 0 (centered). Without this egui
+            // would position the content at the raw offset and only clamp afterward
+            // — that per-frame shift-then-snap is the jitter.
+            let max_off = (display - viewport.size()).max(Vec2::ZERO);
+            target.max(Vec2::ZERO).min(max_off)
+        });
+
+        let mut area = egui::ScrollArea::both().id_salt("page_scroll").auto_shrink([false; 2]);
+        if let Some(off) = forced_offset {
+            area = area.scroll_offset(off);
+        }
+        let out = area.show(ui, |ui| {
+            // Lay the content out at least viewport-sized so a page smaller than the
+            // view can be centered in it (egui otherwise top-left-justifies); when
+            // the page is larger, the extra is the scrollable region. Use the
+            // pre-scrollbar viewport size so a fitting page doesn't flicker a bar.
+            let content_size = display.max(viewport.size());
+            let (content_rect, _) = ui.allocate_exact_size(content_size, Sense::hover());
+            let pad = ((content_size - display) * 0.5).max(Vec2::ZERO);
+            let rect = ERect::from_min_size(content_rect.min + pad, display);
+            ui.painter().image(
+                tex_id,
+                rect,
+                ERect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
             );
-            let rect = resp.rect;
+            let resp = ui.interact(rect, ui.id().with("page_canvas"), Sense::click_and_drag());
+
             let scale = if page_size.x > 0.0 {
                 rect.width() / page_size.x
             } else {
@@ -246,10 +315,27 @@ impl Viewer {
             let to_page = |s: Pos2| ((s - rect.min) / scale).to_pos2();
 
             // --- interaction ---------------------------------------------------
+            // Middle-button drag pans the view (grab-scroll), and is handled
+            // before region logic so it never starts drawing a region.
+            let middle_down = ui.input(|i| i.pointer.middle_down());
+            if middle_down && (self.panning || resp.contains_pointer()) {
+                self.panning = true;
+                // Immediate (un-animated) so the page tracks the cursor 1:1.
+                ui.scroll_with_delta_animation(
+                    ui.input(|i| i.pointer.delta()),
+                    egui::style::ScrollAnimation::none(),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else {
+                self.panning = false;
+            }
+
+            // Region draw/move/resize is the *primary* button only — the `_by`
+            // variants keep middle/secondary buttons out of it.
             // Start from the *press origin*, not interact_pointer_pos: the latter
             // is only sampled once the drag threshold is crossed, which offsets
             // the start by a few pixels from where the user actually clicked.
-            if resp.drag_started() {
+            if resp.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(press) = ui.input(|i| i.pointer.press_origin()) {
                     self.drag = decide_drag(doc, *current_page, *selected, to_page(press), scale);
                     match self.drag {
@@ -260,7 +346,7 @@ impl Viewer {
                     }
                 }
             }
-            if resp.dragged() {
+            if resp.dragged_by(egui::PointerButton::Primary) {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     let pp = to_page(ptr);
                     match &mut self.drag {
@@ -282,7 +368,7 @@ impl Viewer {
                     }
                 }
             }
-            if resp.drag_stopped() {
+            if resp.drag_stopped_by(egui::PointerButton::Primary) {
                 if let Drag::Drawing { start, current } = self.drag {
                     let r = norm_rect(start, current);
                     if r.w > 2.0 && r.h > 2.0 {
@@ -295,6 +381,31 @@ impl Viewer {
             if resp.clicked() {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     *selected = topmost_at(doc, *current_page, to_page(ptr));
+                }
+            }
+
+            // What the idle pointer is over — for the hover highlight + cursor, so
+            // the user can tell when a press will grab a region/handle instead of
+            // drawing. Skipped mid-drag/pan (the action is already decided).
+            let hover = if matches!(self.drag, Drag::Idle) && !self.panning {
+                resp.hover_pos()
+                    .map(|p| hover_target(doc, *current_page, *selected, to_page(p), scale))
+                    .unwrap_or(Hover::None)
+            } else {
+                Hover::None
+            };
+            if !self.panning {
+                match hover {
+                    Hover::Handle(_, i) => ui.ctx().set_cursor_icon(if i == 0 || i == 3 {
+                        egui::CursorIcon::ResizeNwSe
+                    } else {
+                        egui::CursorIcon::ResizeNeSw
+                    }),
+                    Hover::Body(_) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
+                    Hover::None if resp.hovered() => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair)
+                    }
+                    Hover::None => {}
                 }
             }
             if let Some(id) = *selected {
@@ -390,10 +501,15 @@ impl Viewer {
                     }
                 }
 
-                let (stroke_color, fill) = if is_sel {
-                    (ACCENT, ACCENT_FILL)
+                // A region the idle pointer is over (a press would grab it) gets a
+                // brighter, heavier outline so accidental grabs are obvious.
+                let is_hover_body = matches!(hover, Hover::Body(hid) if hid == region.id);
+                let (stroke_color, fill, stroke_w) = if is_sel {
+                    (ACCENT, ACCENT_FILL, 2.0)
+                } else if is_hover_body {
+                    (HOVER, REGION_FILL, 2.0)
                 } else {
-                    (REGION_STROKE, REGION_FILL)
+                    (REGION_STROKE, REGION_FILL, 1.5)
                 };
                 if !drew_overlay {
                     painter.rect_filled(scr, 2.0, fill);
@@ -401,15 +517,17 @@ impl Viewer {
                 painter.rect_stroke(
                     scr,
                     2.0,
-                    Stroke::new(if is_sel { 2.0 } else { 1.5 }, stroke_color),
+                    Stroke::new(stroke_w, stroke_color),
                     egui::StrokeKind::Inside,
                 );
                 if is_sel {
-                    for corner in
-                        [scr.left_top(), scr.right_top(), scr.left_bottom(), scr.right_bottom()]
-                    {
-                        let h = ERect::from_center_size(corner, Vec2::splat(HANDLE));
-                        painter.rect_filled(h, 1.0, ACCENT);
+                    let corners =
+                        [scr.left_top(), scr.right_top(), scr.left_bottom(), scr.right_bottom()];
+                    for (i, corner) in corners.iter().enumerate() {
+                        // Enlarge + recolor the handle under the pointer.
+                        let on = matches!(hover, Hover::Handle(hid, hi) if hid == region.id && hi == i);
+                        let h = ERect::from_center_size(*corner, Vec2::splat(if on { HANDLE * 1.6 } else { HANDLE }));
+                        painter.rect_filled(h, 1.0, if on { HOVER } else { ACCENT });
                     }
                 }
             }
@@ -422,6 +540,9 @@ impl Viewer {
             // texture memory is released.
             self.patches.retain(|id, _| results.contains_key(id));
         });
+        // Mirror the (possibly clamped) offset so next frame's zoom math starts
+        // from where the view actually is — including manual scrolls and pans.
+        self.scroll_offset = out.state.offset;
 
         edited
     }
@@ -469,8 +590,55 @@ fn topmost_at(doc: &Document, page: usize, p: Pos2) -> Option<RegionId> {
         .map(|r| r.id)
 }
 
+/// The four corners of a region, in `Hover::Handle` index order (TL, TR, BL, BR).
+fn region_corners(r: &Rect) -> [Pos2; 4] {
+    [
+        egui::pos2(r.x, r.y),
+        egui::pos2(r.x + r.w, r.y),
+        egui::pos2(r.x, r.y + r.h),
+        egui::pos2(r.x + r.w, r.y + r.h),
+    ]
+}
+
+/// What page-point `pp` is over: a corner handle of the selected region, a region
+/// body, or nothing. This is the single hit-test behind both the hover highlight
+/// and [`decide_drag`], so the highlight always matches what a press would do.
+fn hover_target(
+    doc: &Document,
+    page: usize,
+    selected: Option<RegionId>,
+    pp: Pos2,
+    scale: f32,
+) -> Hover {
+    let grab = HANDLE / scale.max(f32::EPSILON); // grab tolerance in page points
+
+    // Resize handle: a corner of the currently selected region takes priority.
+    if let Some(id) = selected
+        && let Some(r) = doc.regions.iter().find(|r| r.id == id && r.page == page)
+    {
+        for (i, c) in region_corners(&r.rect).iter().enumerate() {
+            if (pp.x - c.x).abs() <= grab && (pp.y - c.y).abs() <= grab {
+                return Hover::Handle(id, i);
+            }
+        }
+    }
+
+    // Body: the topmost region under the pointer.
+    if let Some(r) = doc
+        .regions
+        .iter()
+        .rev()
+        .find(|r| r.page == page && point_in(pp, &r.rect))
+    {
+        return Hover::Body(r.id);
+    }
+
+    Hover::None
+}
+
 /// Decide what a press at page-point `pp` begins: resizing a corner of the
 /// selected region, moving a region under the pointer, or drawing a new one.
+/// Mirrors [`hover_target`]'s hit-test exactly.
 fn decide_drag(
     doc: &Document,
     page: usize,
@@ -478,45 +646,21 @@ fn decide_drag(
     pp: Pos2,
     scale: f32,
 ) -> Drag {
-    let grab = HANDLE / scale.max(f32::EPSILON); // grab tolerance in page points
-
-    // Resize: a corner of the currently selected region.
-    if let Some(id) = selected
-        && let Some(r) = doc.regions.iter().find(|r| r.id == id && r.page == page)
-    {
-        let corners = [
-            egui::pos2(r.rect.x, r.rect.y),
-            egui::pos2(r.rect.x + r.rect.w, r.rect.y),
-            egui::pos2(r.rect.x, r.rect.y + r.rect.h),
-            egui::pos2(r.rect.x + r.rect.w, r.rect.y + r.rect.h),
-        ];
-        const OPPOSITE: [usize; 4] = [3, 2, 1, 0];
-        for (i, c) in corners.iter().enumerate() {
-            if (pp.x - c.x).abs() <= grab && (pp.y - c.y).abs() <= grab {
-                return Drag::Resizing {
-                    id,
-                    fixed: corners[OPPOSITE[i]],
-                };
-            }
+    match hover_target(doc, page, selected, pp, scale) {
+        Hover::Handle(id, i) => {
+            // The drag's anchor is the corner opposite the grabbed one.
+            const OPPOSITE: [usize; 4] = [3, 2, 1, 0];
+            let r = doc
+                .regions
+                .iter()
+                .find(|r| r.id == id)
+                .expect("hover_target returned a live region");
+            Drag::Resizing { id, fixed: region_corners(&r.rect)[OPPOSITE[i]] }
         }
-    }
-
-    // Move: the topmost region whose body is under the pointer.
-    if let Some(r) = doc
-        .regions
-        .iter()
-        .rev()
-        .find(|r| r.page == page && point_in(pp, &r.rect))
-    {
-        return Drag::Moving {
-            id: r.id,
-            grab: egui::vec2(pp.x - r.rect.x, pp.y - r.rect.y),
-        };
-    }
-
-    // Otherwise: start drawing a new region.
-    Drag::Drawing {
-        start: pp,
-        current: pp,
+        Hover::Body(id) => {
+            let r = doc.regions.iter().find(|r| r.id == id).expect("live region");
+            Drag::Moving { id, grab: egui::vec2(pp.x - r.rect.x, pp.y - r.rect.y) }
+        }
+        Hover::None => Drag::Drawing { start: pp, current: pp },
     }
 }

@@ -334,53 +334,14 @@ impl eframe::App for App {
                     action = Some(Action::ToggleSettings);
                 }
             });
-
-            ui.horizontal(|ui| {
-                ui.label("OCR src");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut settings.source_lang)
-                            .desired_width(40.0)
-                            .hint_text("eng"),
-                    )
-                    .changed()
-                {
-                    settings.save();
-                }
-                ui.label("→");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut settings.target_lang)
-                            .desired_width(40.0)
-                            .hint_text("en"),
-                    )
-                    .changed()
-                {
-                    settings.save();
-                }
-                ui.separator();
-                let can_translate =
-                    document.is_some() && selected.is_some() && pending.is_none();
-                if ui
-                    .add_enabled(can_translate, egui::Button::new("Translate selection"))
-                    .clicked()
-                {
-                    action = Some(Action::Translate);
-                }
-                if pending.is_some() {
-                    ui.separator();
-                    ui.spinner();
-                    ui.label("Translating…");
-                }
-                if let Some(err) = error {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::RED, err.as_str());
-                }
-            });
         });
 
-        // --- right panel: selected region info -------------------------------
-        info_panel(ui, document, results, pending, *selected, dirty);
+        // --- right panel: languages + selected region info -------------------
+        // Translation controls (language pickers, the Translate button) live here
+        // so the bar above the document holds only page/zoom (PDF) controls.
+        action = action.or(info_panel(
+            ui, settings, document, results, pending, *selected, dirty, error,
+        ));
 
         // --- central canvas --------------------------------------------------
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -569,14 +530,41 @@ impl eframe::App for App {
 /// Right-hand info panel for the selected region.
 fn info_panel(
     ui: &mut egui::Ui,
+    settings: &mut Settings,
     document: &Option<Document>,
     results: &mut HashMap<RegionId, Translated>,
     pending: &Option<Pending>,
     selected: Option<RegionId>,
     dirty: &mut bool,
-) {
+    error: &Option<String>,
+) -> Option<Action> {
+    let mut action = None;
     egui::Panel::right("info").show_inside(ui, |ui| {
+        // Global translation status + language pickers (apply to every region).
+        if pending.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Translating…");
+            });
+        }
+        if let Some(err) = error {
+            ui.colored_label(egui::Color32::RED, err.as_str());
+        }
+        ui.heading("Languages");
+        // Display names are computed up front so the immutable borrow they need
+        // doesn't overlap the `&mut` the combo takes on the same field.
+        let src_name = crate::config::Language::name_for_ocr(&settings.source_lang).to_owned();
+        if language_combo(ui, "Source (OCR)", "src_lang", &mut settings.source_lang, &src_name, |l| l.ocr) {
+            settings.save();
+        }
+        let tgt_name = crate::config::Language::name_for_iso(&settings.target_lang).to_owned();
+        if language_combo(ui, "Target", "tgt_lang", &mut settings.target_lang, &tgt_name, |l| l.iso) {
+            settings.save();
+        }
+        ui.separator();
+
         ui.heading("Region");
+        let can_translate = document.is_some() && pending.is_none();
         let translating = pending.as_ref().map(|p| p.region) == selected && pending.is_some();
         match selected {
             Some(id) if results.contains_key(&id) => {
@@ -588,6 +576,13 @@ fn info_panel(
                 // Read-only but selectable, so the user can copy without editing.
                 reference_field(ui, "Source", &t.result.source_text);
                 reference_field(ui, "Machine translation", &t.result.translation);
+                if ui
+                    .add_enabled(can_translate, egui::Button::new("Re-translate"))
+                    .on_hover_text("Translate this region again (keeps your style edits)")
+                    .clicked()
+                {
+                    action = Some(Action::Translate);
+                }
                 ui.separator();
 
                 // 1. Editable text — defaults to the machine translation.
@@ -736,12 +731,17 @@ fn info_panel(
                         ui.separator();
                         ui.label("No text layer — the region image is sent to the vision model. (Build with --features ocr to OCR locally.)");
                     }
+                    ui.add_space(6.0);
+                    if ui
+                        .add_enabled(can_translate, egui::Button::new("Translate"))
+                        .clicked()
+                    {
+                        action = Some(Action::Translate);
+                    }
                     ui.separator();
                     ui.monospace(format!("page {}", reg.page + 1));
                     ui.monospace(format!("x {:.0}  y {:.0} pt", reg.rect.x, reg.rect.y));
                     ui.monospace(format!("w {:.0}  h {:.0} pt", reg.rect.w, reg.rect.h));
-                    ui.add_space(4.0);
-                    ui.label("Press “Translate selection”.");
                 }
             }
             None => {
@@ -749,6 +749,39 @@ fn info_panel(
             }
         }
     });
+    action
+}
+
+/// A language dropdown bound to a persisted code. `selected_name` is the display
+/// label for the current value; `code_of` maps a [`Language`] to the code this
+/// field stores (Tesseract for source, ISO for target). Returns true on change.
+fn language_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    salt: &str,
+    current: &mut String,
+    selected_name: &str,
+    code_of: impl Fn(&crate::config::Language) -> &'static str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(selected_name)
+            .show_ui(ui, |ui| {
+                for lang in crate::config::LANGUAGES {
+                    let code = code_of(lang);
+                    if ui
+                        .selectable_label(current.as_str() == code, lang.name)
+                        .clicked()
+                    {
+                        *current = code.to_owned();
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
 }
 
 /// A labelled, read-only-but-copyable text field (selectable label + a copy

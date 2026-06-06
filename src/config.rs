@@ -55,6 +55,49 @@ impl Backend {
     }
 }
 
+/// A language offered in the source/target pickers. `ocr` is the Tesseract code
+/// the OCR source path expects; `iso` is the ISO-639 code translation APIs (e.g.
+/// Google) expect as the target — the two differ for many languages (Japanese is
+/// `jpn` vs `ja`), which is why both are kept.
+pub struct Language {
+    pub name: &'static str,
+    pub ocr: &'static str,
+    pub iso: &'static str,
+}
+
+/// Curated list of languages with installable Tesseract data, for the pickers.
+pub const LANGUAGES: &[Language] = &[
+    Language { name: "English", ocr: "eng", iso: "en" },
+    Language { name: "Japanese", ocr: "jpn", iso: "ja" },
+    Language { name: "Chinese (Simplified)", ocr: "chi_sim", iso: "zh-CN" },
+    Language { name: "Chinese (Traditional)", ocr: "chi_tra", iso: "zh-TW" },
+    Language { name: "Korean", ocr: "kor", iso: "ko" },
+    Language { name: "French", ocr: "fra", iso: "fr" },
+    Language { name: "German", ocr: "deu", iso: "de" },
+    Language { name: "Spanish", ocr: "spa", iso: "es" },
+    Language { name: "Italian", ocr: "ita", iso: "it" },
+    Language { name: "Portuguese", ocr: "por", iso: "pt" },
+    Language { name: "Russian", ocr: "rus", iso: "ru" },
+    Language { name: "Dutch", ocr: "nld", iso: "nl" },
+    Language { name: "Arabic", ocr: "ara", iso: "ar" },
+    Language { name: "Hindi", ocr: "hin", iso: "hi" },
+    Language { name: "Vietnamese", ocr: "vie", iso: "vi" },
+    Language { name: "Thai", ocr: "tha", iso: "th" },
+];
+
+impl Language {
+    /// Display name for an OCR (Tesseract) code, falling back to the raw code so
+    /// a custom value set outside the picker still shows something sensible.
+    pub fn name_for_ocr(code: &str) -> &str {
+        LANGUAGES.iter().find(|l| l.ocr == code).map_or(code, |l| l.name)
+    }
+
+    /// Display name for an ISO target code, falling back to the raw code.
+    pub fn name_for_iso(code: &str) -> &str {
+        LANGUAGES.iter().find(|l| l.iso == code).map_or(code, |l| l.name)
+    }
+}
+
 /// Persisted, non-secret settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {

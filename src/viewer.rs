@@ -16,6 +16,9 @@ const HANDLE: f32 = 7.0;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 8.0;
 const ZOOM_STEP: f32 = 1.25;
+/// Bounds on the page render scale (pixels per point) for on-demand re-rendering.
+const MIN_RENDER_SCALE: f32 = 1.0;
+const MAX_RENDER_SCALE: f32 = 6.0;
 const REGION_STROKE: Color32 = Color32::from_rgb(0xff, 0xa5, 0x00);
 const REGION_FILL: Color32 = Color32::from_rgba_premultiplied(0x30, 0x20, 0x00, 0x20);
 const ACCENT: Color32 = Color32::from_rgb(0x4e, 0x9a, 0xff);
@@ -39,6 +42,9 @@ pub struct Viewer {
     texture: Option<egui::TextureHandle>,
     /// Which page `texture` holds, so we rebuild it on page changes.
     texture_page: usize,
+    /// Render scale (px/pt) the current texture was built at, so we rebuild it
+    /// when the page is re-rendered at a different resolution.
+    texture_scale: f32,
     /// On-screen magnification (1.0 = page shown at its native point size).
     zoom: f32,
     /// When true, zoom is recomputed each frame to fit the viewport width.
@@ -51,6 +57,7 @@ impl Default for Viewer {
         Self {
             texture: None,
             texture_page: 0,
+            texture_scale: 0.0,
             zoom: 1.0,
             fit: true,
             drag: Drag::Idle,
@@ -62,6 +69,7 @@ impl Viewer {
     /// Invalidate cached state (e.g. when a new document is opened).
     pub fn reset(&mut self) {
         self.texture = None;
+        self.texture_scale = 0.0;
         self.drag = Drag::Idle;
         self.fit = true;
         self.zoom = 1.0;
@@ -114,34 +122,19 @@ impl Viewer {
         });
         ui.separator();
 
-        // (Re)build the page texture when the page changed or it's missing.
-        if self.texture.is_none() || self.texture_page != *current_page {
-            if let Some(page) = doc.pages.get(*current_page) {
-                let size = [page.bitmap.width() as usize, page.bitmap.height() as usize];
-                let img = egui::ColorImage::from_rgba_unmultiplied(size, page.bitmap.as_raw());
-                self.texture =
-                    Some(ui.ctx().load_texture("page", img, egui::TextureOptions::LINEAR));
-                self.texture_page = *current_page;
-            } else {
-                self.texture = None;
-            }
-        }
-
-        let (Some(texture), Some(page)) = (self.texture.as_ref(), doc.pages.get(*current_page))
-        else {
+        let Some(page_size_pts) = doc.pages.get(*current_page).map(|p| p.size) else {
+            self.texture = None;
             ui.centered_and_justified(|ui| {
                 ui.label("Open a PDF or image to begin.");
             });
             return edited;
         };
-        let tex_id = texture.id();
-        let page_size = egui::vec2(page.size.0, page.size.1);
+        let page_size = egui::vec2(page_size_pts.0, page_size_pts.1);
 
-        // Fit-to-width recomputes zoom from the available width.
+        // Resolve the on-screen zoom (fit-to-width / Ctrl+scroll) before rendering.
         if self.fit && page_size.x > 0.0 {
             self.zoom = (ui.available_width() / page_size.x).clamp(MIN_ZOOM, MAX_ZOOM);
         }
-        // Ctrl/Cmd + scroll zooms.
         let cmd_scroll = ui.input(|i| {
             if i.modifiers.command {
                 i.smooth_scroll_delta.y
@@ -153,6 +146,36 @@ impl Viewer {
             self.zoom = (self.zoom * (1.0 + cmd_scroll * 0.0015)).clamp(MIN_ZOOM, MAX_ZOOM);
             self.fit = false;
         }
+
+        // Re-render the current page so its raster matches the on-screen size
+        // (zoom × device pixels-per-point), keeping it crisp at high zoom.
+        // Quantized so scrolling the zoom doesn't re-render every frame; a no-op
+        // for image sources.
+        let ppp = ui.ctx().pixels_per_point();
+        let target_scale = render_scale_for(self.zoom, ppp);
+        if (page_scale(doc, *current_page) - target_scale).abs() > 0.1 {
+            let _ = doc.rerender_page(*current_page, target_scale);
+        }
+
+        // (Re)build the texture when the page changed or its raster scale changed.
+        let bitmap_scale = page_scale(doc, *current_page);
+        if self.texture.is_none()
+            || self.texture_page != *current_page
+            || (self.texture_scale - bitmap_scale).abs() > 0.01
+        {
+            if let Some(page) = doc.pages.get(*current_page) {
+                let size = [page.bitmap.width() as usize, page.bitmap.height() as usize];
+                let img = egui::ColorImage::from_rgba_unmultiplied(size, page.bitmap.as_raw());
+                self.texture =
+                    Some(ui.ctx().load_texture("page", img, egui::TextureOptions::LINEAR));
+                self.texture_page = *current_page;
+                self.texture_scale = bitmap_scale;
+            }
+        }
+        let Some(texture) = self.texture.as_ref() else {
+            return edited;
+        };
+        let tex_id = texture.id();
 
         let display = page_size * self.zoom;
 
@@ -271,6 +294,25 @@ impl Viewer {
 
         edited
     }
+}
+
+/// Current render scale (pixels per point) of a page's bitmap.
+fn page_scale(doc: &Document, page: usize) -> f32 {
+    doc.pages.get(page).map_or(1.0, |p| {
+        if p.size.0 > 0.0 {
+            p.bitmap.width() as f32 / p.size.0
+        } else {
+            1.0
+        }
+    })
+}
+
+/// Target render scale (px/pt) for the given on-screen zoom and device
+/// pixels-per-point, clamped and quantized to 0.5 steps so zoom scrolling doesn't
+/// re-render every frame.
+fn render_scale_for(zoom: f32, pixels_per_point: f32) -> f32 {
+    let raw = (zoom * pixels_per_point).clamp(MIN_RENDER_SCALE, MAX_RENDER_SCALE);
+    (raw * 2.0).round() / 2.0
 }
 
 /// Normalize two page-space corners into a non-negative-size [`Rect`].

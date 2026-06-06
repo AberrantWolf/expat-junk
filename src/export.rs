@@ -559,3 +559,36 @@ mod vector_test {
         let _ = std::fs::remove_file(&out);
     }
 }
+
+#[cfg(test)]
+mod rerender_test {
+    use crate::document::Document;
+
+    #[test]
+    fn rerender_page_increases_resolution() {
+        let src = std::env::temp_dir().join("expat-junk-rerender-src.pdf");
+        let bytes = printpdf::PdfDocument::new("src")
+            .with_pages(vec![printpdf::PdfPage::new(
+                printpdf::Mm(210.0),
+                printpdf::Mm(297.0),
+                Vec::new(),
+            )])
+            .save(&printpdf::PdfSaveOptions::default(), &mut Vec::new());
+        std::fs::write(&src, bytes).unwrap();
+
+        let mut doc = Document::open(&src).unwrap();
+        let base_w = doc.pages[0].bitmap.width();
+
+        // Re-render at 4 px/pt; an A4 (595pt wide) should reach ~2380px.
+        doc.rerender_page(0, 4.0).unwrap();
+        let hi_w = doc.pages[0].bitmap.width();
+        assert!(hi_w > base_w, "hi-res not larger: {hi_w} vs {base_w}");
+        let expected = (doc.pages[0].size.0 * 4.0) as u32;
+        assert!(
+            hi_w + 4 >= expected.min(4096),
+            "expected ~{expected}px wide, got {hi_w}"
+        );
+
+        let _ = std::fs::remove_file(&src);
+    }
+}

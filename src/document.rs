@@ -8,7 +8,7 @@
 //!
 //! Nothing here depends on egui: the UI consumes this model, it does not own it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,9 @@ pub struct Document {
     pub pages: Vec<Page>,
     pub regions: Vec<Region>,
     next_region_id: u64,
+    /// Source PDF path, kept so a page can be re-rendered at higher resolution
+    /// when the viewer zooms in. `None` for image sources (no re-render possible).
+    source_path: Option<PathBuf>,
 }
 
 impl Document {
@@ -82,7 +85,22 @@ impl Document {
             pages,
             regions: Vec::new(),
             next_region_id: 0,
+            source_path: is_pdf.then(|| path.to_path_buf()),
         })
+    }
+
+    /// Re-render a page's bitmap at `scale` (pixels per point), so it stays crisp
+    /// when zoomed in. No-op for image sources (nothing to re-render).
+    pub fn rerender_page(&mut self, index: usize, scale: f32) -> Result<()> {
+        let Some(path) = self.source_path.clone() else {
+            return Ok(());
+        };
+        let pdfium = junk_libs_pdfium::instance()?;
+        let (image, _size) = junk_libs_pdfium::render_page_bitmap(pdfium, &path, index, scale)?;
+        if let Some(page) = self.pages.get_mut(index) {
+            page.bitmap = image;
+        }
+        Ok(())
     }
 
     fn open_pdf(path: &Path) -> Result<Vec<Page>> {
@@ -256,6 +274,7 @@ mod tests {
             pages: vec![page_with(chars)],
             regions: Vec::new(),
             next_region_id: 0,
+            source_path: None,
         };
         let id = doc.add_region(
             0,
@@ -275,6 +294,7 @@ mod tests {
             pages: vec![page_with(Vec::new())],
             regions: Vec::new(),
             next_region_id: 0,
+            source_path: None,
         };
         let id = doc.add_region(
             0,

@@ -65,7 +65,9 @@ The design was chosen deliberately; don't silently swap these out.
   `PdfiumLibraryBindingsAlreadyInitialized` — so always go through `instance()`, never bind
   directly. `render_pdf()` rasterizes every page to RGBA *and* extracts the text layer as
   `CharBox`es (via `fpdf_text` loose glyph bounds), flipping PDF's bottom-left coords into our
-  top-left page space. `quantize_zoom()` is there for the future render cache. To change PDFium
+  top-left page space. `render_page_bitmap()` renders a single page at a given scale (px/pt),
+  bitmap only — used by `Document::rerender_page` to re-render the current page crisply on zoom.
+  `quantize_zoom()` is currently unused. To change PDFium
   versions, edit that crate (the `pdfium_NNNN` feature and `build.rs`'s `PDFIUM_VERSION`
   together). The crate's render/text tests live with it; `tests/pdfium_wiring.rs` here only
   guards that runtime binding survives being consumed as a dependency.
@@ -79,12 +81,17 @@ The design was chosen deliberately; don't silently swap these out.
 - **`viewer.rs`** — the interactive page canvas, with its own control bar (zoom −/%/+, Fit
   width, page ◀/▶). Renders the current page to an egui texture and lets the user draw / select
   / move / resize / delete regions. All geometry stays in page points; the page↔screen transform
-  is derived each frame from the displayed image rect, so it's correct at any zoom. Zoom is
-  **display scaling** of the base-resolution texture (Ctrl+scroll or the buttons) — it changes
-  region-selection precision but not raster crispness; true **re-render at zoom×DPI is still
-  deferred** (pages render once at `DEFAULT_RENDER_ZOOM`). Drag start uses `pointer.press_origin()`
-  (not `interact_pointer_pos`, which is only sampled after the drag threshold and offsets the
-  start). **Deferred:** crisp high-zoom re-render, and snapping region edges to `char_boxes`.
+  is derived each frame from the displayed image rect, so it's correct at any zoom. **Crisp
+  zoom:** each frame it computes a target render scale (`zoom × pixels_per_point`, quantized to
+  0.5 steps, clamped 1–6) and, when it differs from the current page bitmap's scale, calls
+  `Document::rerender_page` (→ `junk_libs_pdfium::render_page_bitmap`) so the raster matches the
+  on-screen size instead of being upscaled. The texture rebuilds when the page or its render
+  scale changes. Image sources can't re-render (raster), so they just display-scale. Drag start
+  uses `pointer.press_origin()` (not `interact_pointer_pos`, which is only sampled after the drag
+  threshold and offsets the start). The re-render is synchronous on the UI thread (a brief hitch
+  per zoom quantum at high res); a background-thread render would smooth that. **Deferred:**
+  snapping region edges to `char_boxes`; lazy/bounded page-bitmap memory (all pages still eager-
+  render at `DEFAULT_RENDER_ZOOM`, and visited pages keep their last render scale).
 - **`translate.rs`** — one `Translator` trait, two impls:
   - `GeminiVision` (**default, implemented**): POSTs the region crop (PNG, base64) to Gemini's
     `generateContent` with a `responseSchema` that forces JSON, so we parse source text +

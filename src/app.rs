@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::Result;
 
@@ -280,7 +280,12 @@ impl eframe::App for App {
         // Count regions that still need translating (for the batch menu item).
         let untranslated = document
             .as_ref()
-            .map(|d| d.regions.iter().filter(|r| !results.contains_key(&r.id)).count())
+            .map(|d| {
+                d.regions
+                    .iter()
+                    .filter(|r| !results.contains_key(&r.id))
+                    .count()
+            })
             .unwrap_or(0);
 
         // --- top panel: menu bar + toolbar -----------------------------------
@@ -330,7 +335,10 @@ impl eframe::App for App {
                         ui.close();
                     }
                     if ui
-                        .add_enabled(selected.is_some(), egui::Button::new("Delete selected region"))
+                        .add_enabled(
+                            selected.is_some(),
+                            egui::Button::new("Delete selected region"),
+                        )
                         .clicked()
                     {
                         action = Some(Action::DeleteSelected);
@@ -463,12 +471,26 @@ impl eframe::App for App {
                 }
             }
             Some(Action::SaveProject) => save_project(
-                false, settings, source_path, document, *current_page, results, project_path,
-                dirty, error,
+                false,
+                settings,
+                source_path,
+                document,
+                *current_page,
+                results,
+                project_path,
+                dirty,
+                error,
             ),
             Some(Action::SaveProjectAs) => save_project(
-                true, settings, source_path, document, *current_page, results, project_path,
-                dirty, error,
+                true,
+                settings,
+                source_path,
+                document,
+                *current_page,
+                results,
+                project_path,
+                dirty,
+                error,
             ),
             Some(Action::Export) => {
                 if let (Some(doc), Some(src)) = (document.as_ref(), source_path.as_ref()) {
@@ -516,10 +538,8 @@ impl eframe::App for App {
                 }
             }
             Some(Action::ClearTranslations) => {
-                if !results.is_empty() {
-                    results.clear();
-                    *dirty = true;
-                }
+                *dirty = *dirty || !results.is_empty();
+                results.clear();
             }
             Some(Action::ToggleSettings) => *show_settings = !*show_settings,
         }
@@ -563,6 +583,7 @@ impl eframe::App for App {
 }
 
 /// Right-hand info panel for the selected region.
+#[allow(clippy::too_many_arguments)]
 fn info_panel(
     ui: &mut egui::Ui,
     settings: &mut Settings,
@@ -1022,7 +1043,14 @@ fn start_translation(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let outcome = run_translation(
-            translator, crop, text_layer, provider, model, target_lang, source_lang, cache,
+            translator,
+            crop,
+            text_layer,
+            provider,
+            model,
+            target_lang,
+            source_lang,
+            cache,
         );
         let _ = tx.send(outcome);
     });
@@ -1056,7 +1084,11 @@ fn run_translation(
         None => cache::key_pixels(provider, &model, &target_lang, &crop),
     };
     if let Some(result) = cache.lock().unwrap().get(&key) {
-        return Ok(Translated { result, method, style: RegionStyle::default() });
+        return Ok(Translated {
+            result,
+            method,
+            style: RegionStyle::default(),
+        });
     }
 
     let req = TranslationRequest {
@@ -1066,7 +1098,11 @@ fn run_translation(
     };
     let result = translator.translate(&req)?;
     cache.lock().unwrap().insert(key, result.clone());
-    Ok(Translated { result, method, style: RegionStyle::default() })
+    Ok(Translated {
+        result,
+        method,
+        style: RegionStyle::default(),
+    })
 }
 
 /// Provider id and model string used for cache keys.

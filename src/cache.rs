@@ -65,7 +65,9 @@ impl TranslationCache {
 /// is collapsed so trivial layout differences don't cause misses.
 pub fn key_text(provider: &str, model: &str, lang: &str, text: &str) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    make_key(provider, model, lang, 't', |h| h.update(normalized.as_bytes()))
+    make_key(provider, model, lang, 't', |h| {
+        h.update(normalized.as_bytes())
+    })
 }
 
 /// Cache key from a region's **pixels** — fallback for pages with no text layer
@@ -115,10 +117,22 @@ mod tests {
     fn pixel_key_is_stable_and_content_sensitive() {
         let a = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
         let b = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 2, 3, 255]));
-        assert_eq!(key_pixels("gemini", "m", "en", &a), key_pixels("gemini", "m", "en", &a));
-        assert_ne!(key_pixels("gemini", "m", "en", &a), key_pixels("gemini", "m", "en", &b));
-        assert_ne!(key_pixels("gemini", "m", "en", &a), key_pixels("gemini", "m", "fr", &a));
-        assert_ne!(key_pixels("gemini", "m", "en", &a), key_pixels("gemini", "n", "en", &a));
+        assert_eq!(
+            key_pixels("gemini", "m", "en", &a),
+            key_pixels("gemini", "m", "en", &a)
+        );
+        assert_ne!(
+            key_pixels("gemini", "m", "en", &a),
+            key_pixels("gemini", "m", "en", &b)
+        );
+        assert_ne!(
+            key_pixels("gemini", "m", "en", &a),
+            key_pixels("gemini", "m", "fr", &a)
+        );
+        assert_ne!(
+            key_pixels("gemini", "m", "en", &a),
+            key_pixels("gemini", "n", "en", &a)
+        );
     }
 
     #[test]

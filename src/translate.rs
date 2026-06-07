@@ -180,7 +180,9 @@ impl Translator for TesseractText {
             )?;
         match self.api {
             TextApi::Google => translate_google(&self.api_key, source, req.target_lang),
-            TextApi::DeepL => anyhow::bail!("DeepL isn't implemented yet — choose Google or Gemini"),
+            TextApi::DeepL => {
+                anyhow::bail!("DeepL isn't implemented yet — choose Google or Gemini")
+            }
             TextApi::Kagi => anyhow::bail!("Kagi isn't implemented yet — choose Google or Gemini"),
         }
     }
@@ -205,7 +207,9 @@ fn translate_google(
         .context("calling Google Translate")?;
 
     let status = resp.status();
-    let value: serde_json::Value = resp.json().context("reading the Google Translate response")?;
+    let value: serde_json::Value = resp
+        .json()
+        .context("reading the Google Translate response")?;
     if !status.is_success() {
         let msg = value
             .pointer("/error/message")

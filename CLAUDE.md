@@ -28,8 +28,36 @@ cargo test renders_a_generated_pdf   # run that single test by name
 The first build compiles the `junk-libs-pdfium` dependency, whose `build.rs`
 downloads the matching PDFium binary (~a few MB) into this build's `OUT_DIR`. It
 needs network access once per target dir; subsequent builds are offline
-(idempotent — skips if the lib is present). The path dependency means
-`../junk-libs` must be checked out alongside this repo.
+(idempotent — skips if the lib is present).
+
+### Depending on junk-libs (git, not path)
+
+The four `junk-libs-*` crates are **git dependencies** on
+`github.com/AberrantWolf/junk-libs`, pinned by `Cargo.lock`. CI and the release
+runners only check out *this* repo, so a path dep would break there — the lockfile
+revision is what gets built. To bump to a newer junk-libs commit, push it there and
+`cargo update -p junk-libs-egui-docview …` (or the specific crate). **For local
+co-development against a sibling `../junk-libs` checkout, uncomment the `[patch]`
+block at the bottom of `Cargo.toml`** — it redirects all four crates to the local
+path. Leave it commented for commits/CI (Cargo errors if the path is absent).
+
+### CI and release (GitHub Actions)
+
+- **`.github/workflows/ci.yml`** — on push/PR: `cargo fmt --check`, `cargo clippy
+  --all-targets --locked -- -D warnings`, and `cargo test --locked` across
+  Linux/macOS/Windows. Lints the **default** build (no `ocr`, so no Tesseract on the
+  runners). Keep the tree fmt- and clippy-clean or CI fails.
+- **`.github/workflows/release.yml`** — on a `v*` tag: builds the `expat-junk` GUI
+  binary for linux-x64 / macos-x64 / macos-arm64 / windows-x64 and packages a native
+  bundle each (Linux **AppImage**, macOS **.app** zipped, Windows **zip**). Each bundle
+  ships the PDFium binary **next to where `junk-libs-pdfium::instance()` looks for it**
+  at runtime — `../lib` (AppImage), `../Frameworks` (.app), or beside the `.exe`
+  (Windows) — found by globbing the vendored `target/.../build/junk-libs-pdfium-*/out`
+  path and rpath-fixed (`patchelf` / `install_name_tool`). Bundle metadata + a
+  placeholder icon live in `assets/` (`Info.plist`, `entitlements.plist`,
+  `expat-junk.desktop`, `icon.{svg,icns,ico}`, `icon-256*.png` — regenerate the raster
+  formats from `icon.svg`). macOS signing/notarization is **gated on repo secrets**
+  (`MACOS_*`); without them the `.app` still builds, just unsigned.
 
 ## Architecture and the decisions behind it
 
@@ -60,7 +88,7 @@ The design was chosen deliberately; don't silently swap these out.
 
 `document → ui → translate → export`, with `config` supplying provider choice and keys.
 
-- **`junk-libs-pdfium`** (external crate, `../junk-libs/junk-libs-pdfium`, path dependency) —
+- **`junk-libs-pdfium`** (external crate, git dep on `github.com/AberrantWolf/junk-libs`) —
   the GUI-agnostic render core, lifted out of this repo so print-junk can share it. Its own
   `build.rs` vendors the matching PDFium binary into `OUT_DIR` (no setup in this repo).
   `instance()` returns a process-wide `&'static Pdfium`, bound lazily with a system fallback.
@@ -78,7 +106,7 @@ The design was chosen deliberately; don't silently swap these out.
   render parallelism. To change PDFium versions, edit that crate (the `pdfium_NNNN` feature and
   `build.rs`'s `PDFIUM_VERSION` together). The crate's render/text tests live with it;
   `tests/pdfium_wiring.rs` here only guards that runtime binding survives being consumed as a dep.
-- **The PDF-view stack lives in three sibling `junk-libs` crates** (path deps), so the widget is
+- **The PDF-view stack lives in three sibling `junk-libs` crates** (git deps), so the widget is
   reusable (print-junk can adopt it) and the layers stay decoupled:
   - **`junk-libs-egui-docview`** — the reusable, document-format-agnostic interactive widget
     (`DocView`) plus the seam it's driven through: the `PageModel` trait (the host's document,

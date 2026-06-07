@@ -16,13 +16,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, FontRef, Glyph, PxScale, ScaleFont, point};
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
 use lopdf::{Dictionary, Object, Stream};
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, XObjectTransform};
 
-use junk_libs_raster::{sample_background, PixelRect};
+use junk_libs_raster::{PixelRect, sample_background};
 
 use crate::app::{Justify, Rotate, Translated};
 use crate::document::{Document, RegionId};
@@ -86,7 +86,8 @@ pub fn export_vector(
                 h: (region.rect.h * scale_y).round() as i64,
             };
             let bg = effective_bg(t, || sample_background(&page.bitmap, px));
-            let (pw, ph, rgb) = render_patch(region.rect.w, region.rect.h, bg, t, &font, &font_bold);
+            let (pw, ph, rgb) =
+                render_patch(region.rect.w, region.rect.h, bg, t, &font, &font_bold);
 
             let img_id = add_image_xobject(&mut pdf, pw, ph, rgb);
             overlay_n += 1;
@@ -172,7 +173,12 @@ pub(crate) fn render_region_patch(
     };
     draw_text(
         &mut patch,
-        PixelRect { x: 0, y: 0, w: bw as i64, h: bh as i64 },
+        PixelRect {
+            x: 0,
+            y: 0,
+            w: bw as i64,
+            h: bh as i64,
+        },
         t.display_text().trim(),
         font,
         color,
@@ -288,7 +294,15 @@ fn bake_region(
         return;
     }
     let bg = effective_bg(t, || sample_background(img, rect));
-    let patch = render_region_patch(rect.w as u32, rect.h as u32, bg, t, regular, bold, px_per_pt);
+    let patch = render_region_patch(
+        rect.w as u32,
+        rect.h as u32,
+        bg,
+        t,
+        regular,
+        bold,
+        px_per_pt,
+    );
     for (dx, dy, px) in patch.enumerate_pixels() {
         let x = rect.x + dx as i64;
         let y = rect.y + dy as i64;
@@ -300,6 +314,7 @@ fn bake_region(
 
 /// Wrap `text` to the rect width at the largest size (capped) that fits the
 /// height, then rasterize it into the rect with the given horizontal alignment.
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     img: &mut RgbaImage,
     rect: PixelRect,
@@ -349,7 +364,8 @@ fn draw_text(
         let mut pen_x = rect.x as f32 + pad + indent;
         for ch in line.chars() {
             let id = font.glyph_id(ch);
-            let glyph: Glyph = id.with_scale_and_position(PxScale::from(size), point(pen_x, baseline_y));
+            let glyph: Glyph =
+                id.with_scale_and_position(PxScale::from(size), point(pen_x, baseline_y));
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
@@ -369,9 +385,7 @@ fn draw_text(
 /// Greedy word-wrap (respecting existing newlines) at the given size.
 fn wrap_lines(text: &str, font: &FontRef, size: f32, max_w: f32) -> Vec<String> {
     let scaled = font.as_scaled(PxScale::from(size));
-    let measure = |s: &str| -> f32 {
-        s.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
-    };
+    let measure = |s: &str| -> f32 { s.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum() };
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
         let mut line = String::new();
@@ -446,9 +460,22 @@ mod tests {
         // Rotation (either direction) lays text out swapped then rotates back to
         // fill the region, so the returned patch still matches the region size.
         for rotate in [Rotate::Cw, Rotate::Ccw] {
-            let rotated = styled("hello", RegionStyle { rotate, ..Default::default() });
-            let patch =
-                render_region_patch(120, 40, Rgba([255, 255, 255, 255]), &rotated, &font, &bold, 2.0);
+            let rotated = styled(
+                "hello",
+                RegionStyle {
+                    rotate,
+                    ..Default::default()
+                },
+            );
+            let patch = render_region_patch(
+                120,
+                40,
+                Rgba([255, 255, 255, 255]),
+                &rotated,
+                &font,
+                &bold,
+                2.0,
+            );
             assert_eq!(patch.dimensions(), (120, 40));
         }
     }
@@ -482,7 +509,8 @@ mod tests {
             Translated {
                 result: TranslationResult {
                     source_text: "こんにちは世界".to_string(),
-                    translation: "Hello world, this is a longer line to exercise wrapping".to_string(),
+                    translation: "Hello world, this is a longer line to exercise wrapping"
+                        .to_string(),
                     alternatives: Vec::new(),
                     explanation: None,
                 },
@@ -495,7 +523,11 @@ mod tests {
         export_raster(&doc, &results, &out).expect("export");
         let written = std::fs::read(&out).expect("read output");
         assert!(written.starts_with(b"%PDF"), "output is not a PDF");
-        assert!(written.len() > 1000, "output suspiciously small: {}", written.len());
+        assert!(
+            written.len() > 1000,
+            "output suspiciously small: {}",
+            written.len()
+        );
 
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&out);
@@ -629,7 +661,10 @@ mod vector_test {
         let top = dark(60.0, 60.0, 240.0, 40.0);
         let bottom = dark(60.0, 842.0 - 100.0, 240.0, 40.0);
         assert!(top > 0, "no overlay text rendered in the region");
-        assert!(top > bottom, "overlay appears flipped (top={top}, bottom={bottom})");
+        assert!(
+            top > bottom,
+            "overlay appears flipped (top={top}, bottom={bottom})"
+        );
 
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&out);

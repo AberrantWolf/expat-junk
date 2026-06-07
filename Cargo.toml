@@ -12,17 +12,20 @@ directories = "6.0.0"
 eframe = "0.34.3"
 egui = "0.34.3"
 image = "0.25.10"
-# Shared junk-libs crates (sibling-repo path deps for local development):
+# Shared junk-libs crates, fetched from GitHub and pinned by Cargo.lock so CI and
+# release runners (which only check out expat-junk) build the published revision,
+# not a local checkout. For local co-development against a sibling junk-libs
+# working copy, uncomment the `[patch]` block at the bottom of this file.
 # - egui-docview: the reusable interactive page-view widget (DocView + PageModel).
 # - egui-pdfdoc: the batteries-included PDFium-backed Document implementing PageModel.
 # - raster: GUI-agnostic page-bitmap helpers (sample_background), shared by the
 #   widget's overlay and our export code.
 # - pdfium: render core (still used directly by export.rs for vector export/tests).
 #   See its CLAUDE.md note on version pinning.
-junk-libs-egui-docview = { path = "../junk-libs/junk-libs-egui-docview" }
-junk-libs-egui-pdfdoc = { path = "../junk-libs/junk-libs-egui-pdfdoc" }
-junk-libs-raster = { path = "../junk-libs/junk-libs-raster" }
-junk-libs-pdfium = { path = "../junk-libs/junk-libs-pdfium" }
+junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs" }
+junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs" }
+junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs" }
+junk-libs-pdfium = { git = "https://github.com/AberrantWolf/junk-libs" }
 keyring = "4.0.1"
 leptess = { version = "0.14.0", optional = true }
 lopdf = "0.41.0"
@@ -40,3 +43,13 @@ thiserror = "2.0.18"
 # OCR for the text-API path (Google/DeepL/Kagi). Off by default because leptess
 # links the system Tesseract + Leptonica C libraries at build time.
 ocr = ["dep:leptess"]
+
+# Local co-development against a sibling junk-libs checkout: uncomment to build
+# expat-junk against your working copy instead of the pinned GitHub revision.
+# Leave commented for normal builds, CI, and releases (Cargo errors if the path
+# is absent, e.g. on a CI runner that only checks out expat-junk).
+# [patch."https://github.com/AberrantWolf/junk-libs"]
+# junk-libs-egui-docview = { path = "../junk-libs/junk-libs-egui-docview" }
+# junk-libs-egui-pdfdoc = { path = "../junk-libs/junk-libs-egui-pdfdoc" }
+# junk-libs-raster = { path = "../junk-libs/junk-libs-raster" }
+# junk-libs-pdfium = { path = "../junk-libs/junk-libs-pdfium" }

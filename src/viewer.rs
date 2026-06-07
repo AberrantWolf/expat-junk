@@ -143,8 +143,7 @@ impl RegionOverlay for TranslationFrame<'_> {
             h: h_px,
         };
         if self.patches.get(&id).map(|c| &c.key) != Some(&key) {
-            let patch =
-                render_region_patch(w_px, h_px, bg, t, self.font, self.font_bold, scale);
+            let patch = render_region_patch(w_px, h_px, bg, t, self.font, self.font_bold, scale);
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [patch.width() as usize, patch.height() as usize],
                 patch.as_raw(),

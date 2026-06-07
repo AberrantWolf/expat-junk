@@ -45,10 +45,8 @@ impl Project {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let project: Project =
-            serde_json::from_slice(&bytes).context("parsing project file")?;
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let project: Project = serde_json::from_slice(&bytes).context("parsing project file")?;
         if project.version > FORMAT_VERSION {
             anyhow::bail!(
                 "this project was saved by a newer version of expat-junk (format {})",

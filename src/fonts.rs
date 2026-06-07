@@ -21,8 +21,7 @@ pub const NOTO_SANS_JP: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf")
 /// (the font's default instance is Thin) and an honest bold option.
 pub fn weighted(bold: bool) -> ab_glyph::FontRef<'static> {
     use ab_glyph::VariableFont;
-    let mut font = ab_glyph::FontRef::try_from_slice(NOTO_SANS_JP)
-        .expect("bundled font is valid");
+    let mut font = ab_glyph::FontRef::try_from_slice(NOTO_SANS_JP).expect("bundled font is valid");
     font.set_variation(b"wght", if bold { 700.0 } else { 400.0 });
     font
 }

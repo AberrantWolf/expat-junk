@@ -1,0 +1,247 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.display_name }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      HAS_MACOS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            lib_name: libpdfium.so
+            display_name: linux-x64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            lib_name: libpdfium.dylib
+            display_name: macos-x64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            lib_name: libpdfium.dylib
+            display_name: macos-arm64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            lib_name: pdfium.dll
+            display_name: windows-x64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgl1-mesa-dev libgtk-3-dev libatk1.0-dev patchelf
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-registry-
+
+      # GUI-only, single binary `expat-junk`. The `ocr` feature stays off (it links
+      # system Tesseract/Leptonica at build time); the default release build needs
+      # no extra native deps beyond PDFium, which junk-libs-pdfium vendors itself.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # --- macOS code signing setup (skipped if signing secrets are absent) ---
+
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS' && env.HAS_MACOS_SIGNING == 'true'
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KC_PW: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$CERT_B64" | base64 --decode -o cert.p12
+          security create-keychain -p "$KC_PW" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KC_PW" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PW" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KC_PW" build.keychain
+          rm cert.p12
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain \
+            | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity found in keychain"
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Found signing identity: $IDENTITY"
+
+      # --- macOS .app bundle ---
+
+      - name: Build GUI .app bundle (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          APP="Expat Junk.app"
+
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Frameworks"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp "target/${{ matrix.target }}/release/expat-junk" "$APP/Contents/MacOS/"
+          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
+          # path); locate it there. instance() then finds it via ../Frameworks
+          # relative to the binary at runtime (exe-relative discovery).
+          PDFIUM_LIB=$(find "target/${{ matrix.target }}/release/build" -path "*junk-libs-pdfium-*/out/pdfium/lib/${{ matrix.lib_name }}" | head -n1)
+          test -n "$PDFIUM_LIB" || { echo "::error::libpdfium not found in build output"; exit 1; }
+          cp "$PDFIUM_LIB" "$APP/Contents/Frameworks/"
+          cp "assets/icon.icns" "$APP/Contents/Resources/AppIcon.icns"
+
+          # Substitute version into Info.plist
+          sed "s/\${VERSION}/${VERSION#v}/g" assets/Info.plist > "$APP/Contents/Info.plist"
+
+          # Fix rpath for the .app bundle layout
+          install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/expat-junk"
+
+          echo "GUI_APP=${APP}" >> "$GITHUB_ENV"
+          echo "GUI_ARCHIVE=Expat-Junk-${VERSION}-${{ matrix.display_name }}.zip" >> "$GITHUB_ENV"
+
+      - name: Sign GUI .app bundle (macOS)
+        if: runner.os == 'macOS' && env.HAS_MACOS_SIGNING == 'true'
+        shell: bash
+        run: |
+          ENTITLEMENTS="assets/entitlements.plist"
+
+          # Sign inner Mach-O files first, then the bundle.
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" \
+            "$GUI_APP/Contents/Frameworks/${{ matrix.lib_name }}"
+          codesign --force --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS" \
+            --sign "$MACOS_SIGN_IDENTITY" \
+            "$GUI_APP/Contents/MacOS/expat-junk"
+          codesign --force --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS" \
+            --sign "$MACOS_SIGN_IDENTITY" \
+            "$GUI_APP"
+
+          codesign --verify --deep --strict --verbose=2 "$GUI_APP"
+
+      - name: Zip GUI .app bundle (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "$GUI_APP" "$GUI_ARCHIVE"
+
+      - name: Notarize and staple (macOS)
+        if: runner.os == 'macOS' && env.HAS_MACOS_SIGNING == 'true'
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PW: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        shell: bash
+        run: |
+          xcrun notarytool submit "$GUI_ARCHIVE" \
+            --apple-id "$APPLE_ID" \
+            --password "$NOTARY_PW" \
+            --team-id "$TEAM_ID" \
+            --wait
+          xcrun stapler staple "$GUI_APP"
+          xcrun stapler validate "$GUI_APP"
+
+          # Re-zip so the downloaded archive carries the stapled ticket.
+          rm "$GUI_ARCHIVE"
+          ditto -c -k --sequesterRsrc --keepParent "$GUI_APP" "$GUI_ARCHIVE"
+
+      # --- Linux AppImage ---
+
+      - name: Package GUI (Linux AppImage)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          APPDIR="Expat-Junk.AppDir"
+
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+
+          cp "target/${{ matrix.target }}/release/expat-junk" "$APPDIR/usr/bin/"
+          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
+          # path); instance() finds it via ../lib relative to the binary at runtime.
+          PDFIUM_LIB=$(find "target/${{ matrix.target }}/release/build" -path "*junk-libs-pdfium-*/out/pdfium/lib/${{ matrix.lib_name }}" | head -n1)
+          test -n "$PDFIUM_LIB" || { echo "::error::libpdfium not found in build output"; exit 1; }
+          cp "$PDFIUM_LIB" "$APPDIR/usr/lib/"
+          cp "assets/expat-junk.desktop" "$APPDIR/"
+          cp "assets/icon-256.png" "$APPDIR/expat-junk.png"
+
+          # Fix rpath for the AppImage layout
+          patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/expat-junk"
+
+          # Create AppRun symlink
+          ln -s usr/bin/expat-junk "$APPDIR/AppRun"
+
+          # Download and run appimagetool
+          wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract-and-run "$APPDIR" \
+            "Expat-Junk-${VERSION}-linux-x64.AppImage"
+
+          echo "GUI_ARCHIVE=Expat-Junk-${VERSION}-linux-x64.AppImage" >> "$GITHUB_ENV"
+
+      # --- Windows zip ---
+
+      - name: Package GUI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = "$env:GITHUB_REF_NAME"
+          $GuiDir = "Expat-Junk-${Version}-${{ matrix.display_name }}"
+          New-Item -ItemType Directory -Path $GuiDir
+          Copy-Item "target\${{ matrix.target }}\release\expat-junk.exe" "$GuiDir\"
+          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
+          # path); instance() finds it beside the .exe at runtime.
+          $PdfiumDll = Get-ChildItem -Path "target\${{ matrix.target }}\release\build" -Recurse -Filter "pdfium.dll" |
+            Where-Object { $_.FullName -like "*junk-libs-pdfium-*\out\pdfium\bin\*" } |
+            Select-Object -First 1
+          if (-not $PdfiumDll) { throw "pdfium.dll not found in build output" }
+          Copy-Item $PdfiumDll.FullName "$GuiDir\"
+          Compress-Archive -Path "$GuiDir\*" -DestinationPath "${GuiDir}.zip"
+          echo "GUI_ARCHIVE=${GuiDir}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload GUI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-${{ matrix.display_name }}
+          path: ${{ env.GUI_ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

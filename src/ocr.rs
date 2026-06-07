@@ -27,8 +27,9 @@ pub fn recognize(image: &image::RgbaImage, lang: &str) -> anyhow::Result<String>
 
     // Errors are formatted via Display rather than `?` so we don't depend on the
     // leptess error types being Send + Sync.
-    let mut tess = leptess::LepTess::new(None, lang)
-        .map_err(|e| anyhow::anyhow!("starting Tesseract for '{lang}' (is its tessdata installed?): {e}"))?;
+    let mut tess = leptess::LepTess::new(None, lang).map_err(|e| {
+        anyhow::anyhow!("starting Tesseract for '{lang}' (is its tessdata installed?): {e}")
+    })?;
     tess.set_image_from_mem(&png)
         .map_err(|e| anyhow::anyhow!("loading region into Tesseract: {e}"))?;
     let text = tess

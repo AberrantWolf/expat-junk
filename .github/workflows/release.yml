@@ -38,6 +38,8 @@ jobs:
             display_name: windows-x64
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

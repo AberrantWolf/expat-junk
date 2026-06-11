@@ -14,13 +14,6 @@ and translated text. Licensed under the **SIL Open Font License, Version 1.1**.
 The full license text ships alongside the font at
 [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt).
 
-## 🔧 Runtime native component
-
-### PDFium
-
-PDF rendering uses **PDFium**, downloaded at build time by the
-`junk-libs-pdfium` crate (a prebuilt binary from the
-[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
-project). PDFium is licensed under the **BSD-3-Clause** license and is **not**
-checked into this repository — it is fetched into the build directory on the
-first build.
+PDF rendering is pure Rust ([hayro](https://github.com/LaurenzV/hayro) via the
+`junk-libs-platen` crate, MIT/Apache-2.0) — an ordinary crate dependency like
+the rest, with no separately-licensed native component.

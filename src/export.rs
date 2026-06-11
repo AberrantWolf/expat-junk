@@ -564,8 +564,7 @@ mod orientation_test {
         export_raster(&doc, &HashMap::new(), &out).unwrap();
 
         // Re-render the exported PDF and confirm the marker is still at the top.
-        let pdfium = junk_libs_pdfium::instance().unwrap();
-        let rendered = junk_libs_pdfium::render_pdf(pdfium, &out, 1.0).unwrap();
+        let rendered = junk_libs_platen::render_pdf(&out, 1.0).unwrap();
         let img = &rendered[0].image;
         let (rw, rh) = (img.width(), img.height());
         let top_left = img.get_pixel(rw / 20, rh / 20);
@@ -639,8 +638,7 @@ mod vector_test {
 
         // Re-render and confirm the overlay (black text on white) landed near the
         // TOP, not flipped to the bottom.
-        let pdfium = junk_libs_pdfium::instance().unwrap();
-        let rendered = junk_libs_pdfium::render_pdf(pdfium, &out, 1.0).unwrap();
+        let rendered = junk_libs_platen::render_pdf(&out, 1.0).unwrap();
         let img = &rendered[0].image;
         let sx = img.width() as f32 / 595.0;
         let sy = img.height() as f32 / 842.0;

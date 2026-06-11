@@ -22,19 +22,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            lib_name: libpdfium.so
             display_name: linux-x64
           - target: x86_64-apple-darwin
             runner: macos-latest
-            lib_name: libpdfium.dylib
             display_name: macos-x64
           - target: aarch64-apple-darwin
             runner: macos-latest
-            lib_name: libpdfium.dylib
             display_name: macos-arm64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            lib_name: pdfium.dll
             display_name: windows-x64
     steps:
       - uses: actions/checkout@v6
@@ -49,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libgl1-mesa-dev libgtk-3-dev libatk1.0-dev patchelf
+            libxkbcommon-dev libgl1-mesa-dev libgtk-3-dev libatk1.0-dev
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -61,8 +57,8 @@ jobs:
           restore-keys: ${{ matrix.target }}-cargo-registry-
 
       # GUI-only, single binary `expat-junk`. The `ocr` feature stays off (it links
-      # system Tesseract/Leptonica at build time); the default release build needs
-      # no extra native deps beyond PDFium, which junk-libs-pdfium vendors itself.
+      # system Tesseract/Leptonica at build time); PDF rendering is pure Rust
+      # (junk-libs-platen), so the default release build needs no extra native deps.
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -104,23 +100,15 @@ jobs:
           APP="Expat Junk.app"
 
           mkdir -p "$APP/Contents/MacOS"
-          mkdir -p "$APP/Contents/Frameworks"
           mkdir -p "$APP/Contents/Resources"
 
+          # The render engine is pure Rust (junk-libs-platen) — the binary is
+          # self-contained, nothing to bundle into Frameworks.
           cp "target/${{ matrix.target }}/release/expat-junk" "$APP/Contents/MacOS/"
-          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
-          # path); locate it there. instance() then finds it via ../Frameworks
-          # relative to the binary at runtime (exe-relative discovery).
-          PDFIUM_LIB=$(find "target/${{ matrix.target }}/release/build" -path "*junk-libs-pdfium-*/out/pdfium/lib/${{ matrix.lib_name }}" | head -n1)
-          test -n "$PDFIUM_LIB" || { echo "::error::libpdfium not found in build output"; exit 1; }
-          cp "$PDFIUM_LIB" "$APP/Contents/Frameworks/"
           cp "assets/icon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
           # Substitute version into Info.plist
           sed "s/\${VERSION}/${VERSION#v}/g" assets/Info.plist > "$APP/Contents/Info.plist"
-
-          # Fix rpath for the .app bundle layout
-          install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/expat-junk"
 
           echo "GUI_APP=${APP}" >> "$GITHUB_ENV"
           echo "GUI_ARCHIVE=Expat-Junk-${VERSION}-${{ matrix.display_name }}.zip" >> "$GITHUB_ENV"
@@ -131,10 +119,7 @@ jobs:
         run: |
           ENTITLEMENTS="assets/entitlements.plist"
 
-          # Sign inner Mach-O files first, then the bundle.
-          codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGN_IDENTITY" \
-            "$GUI_APP/Contents/Frameworks/${{ matrix.lib_name }}"
+          # Sign the binary, then the bundle (no bundled libraries to sign).
           codesign --force --options runtime --timestamp \
             --entitlements "$ENTITLEMENTS" \
             --sign "$MACOS_SIGN_IDENTITY" \
@@ -181,19 +166,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           APPDIR="Expat-Junk.AppDir"
 
-          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+          mkdir -p "$APPDIR/usr/bin"
 
+          # The render engine is pure Rust (junk-libs-platen) — the binary is
+          # self-contained, no usr/lib payload or rpath fixes needed.
           cp "target/${{ matrix.target }}/release/expat-junk" "$APPDIR/usr/bin/"
-          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
-          # path); instance() finds it via ../lib relative to the binary at runtime.
-          PDFIUM_LIB=$(find "target/${{ matrix.target }}/release/build" -path "*junk-libs-pdfium-*/out/pdfium/lib/${{ matrix.lib_name }}" | head -n1)
-          test -n "$PDFIUM_LIB" || { echo "::error::libpdfium not found in build output"; exit 1; }
-          cp "$PDFIUM_LIB" "$APPDIR/usr/lib/"
           cp "assets/expat-junk.desktop" "$APPDIR/"
           cp "assets/icon-256.png" "$APPDIR/expat-junk.png"
-
-          # Fix rpath for the AppImage layout
-          patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/expat-junk"
 
           # Create AppRun symlink
           ln -s usr/bin/expat-junk "$APPDIR/AppRun"
@@ -215,14 +194,9 @@ jobs:
           $Version = "$env:GITHUB_REF_NAME"
           $GuiDir = "Expat-Junk-${Version}-${{ matrix.display_name }}"
           New-Item -ItemType Directory -Path $GuiDir
+          # The render engine is pure Rust (junk-libs-platen) — the .exe is
+          # self-contained, no DLL to ship alongside it.
           Copy-Item "target\${{ matrix.target }}\release\expat-junk.exe" "$GuiDir\"
-          # PDFium is vendored by junk-libs-pdfium into its build OUT_DIR (hashed
-          # path); instance() finds it beside the .exe at runtime.
-          $PdfiumDll = Get-ChildItem -Path "target\${{ matrix.target }}\release\build" -Recurse -Filter "pdfium.dll" |
-            Where-Object { $_.FullName -like "*junk-libs-pdfium-*\out\pdfium\bin\*" } |
-            Select-Object -First 1
-          if (-not $PdfiumDll) { throw "pdfium.dll not found in build output" }
-          Copy-Item $PdfiumDll.FullName "$GuiDir\"
           Compress-Archive -Path "$GuiDir\*" -DestinationPath "${GuiDir}.zip"
           echo "GUI_ARCHIVE=${GuiDir}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 

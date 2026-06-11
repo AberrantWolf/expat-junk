@@ -49,20 +49,11 @@ way more than it's worth for "professional" tools or translation.
 ## 🧰 Prerequisites
 
 - A recent **stable Rust toolchain** (install via [`rustup`](https://rustup.rs)).
-- 🧱 **The [`junk-libs`](https://github.com/AberrantWolf/junk-libs) repo checked
-  out as a sibling directory** (`../junk-libs`). expat-junk uses its
-  `junk-libs-pdfium` crate for PDF rendering through a path dependency, so the
-  two repos need to sit next to each other:
-
-  ```
-  programming/
-  ├── expat-junk/
-  └── junk-libs/
-  ```
-
-- 🌐 **Network access on the first build only.** `junk-libs-pdfium`'s build
-  script downloads a prebuilt PDFium binary into the build directory (once per
-  target dir — every build after that is offline).
+- 🧱 The shared [`junk-libs`](https://github.com/AberrantWolf/junk-libs) crates
+  (including `junk-libs-platen`, the pure-Rust PDF renderer) are ordinary git
+  dependencies fetched by Cargo — no sibling checkout or binary downloads
+  needed. For co-developing against a local `../junk-libs` working copy,
+  uncomment the `[patch]` block at the bottom of `Cargo.toml`.
 
 ---
 
@@ -187,6 +178,5 @@ at your option. Unless you explicitly state otherwise, any contribution you
 submit for inclusion shall be dual-licensed as above, without any additional
 terms or conditions.
 
-🔤 **Third-party components** (the bundled Noto Sans JP font, and the
-build-time PDFium binary) carry their own licenses — see
-[THIRD-PARTY.md](THIRD-PARTY.md).
+🔤 **Third-party components** (the bundled Noto Sans JP font) carry their own
+licenses — see [THIRD-PARTY.md](THIRD-PARTY.md).

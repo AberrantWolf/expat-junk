@@ -17,15 +17,15 @@ image = "0.25.10"
 # not a local checkout. For local co-development against a sibling junk-libs
 # working copy, uncomment the `[patch]` block at the bottom of this file.
 # - egui-docview: the reusable interactive page-view widget (DocView + PageModel).
-# - egui-pdfdoc: the batteries-included PDFium-backed Document implementing PageModel.
+# - egui-pdfdoc: the batteries-included platen-backed Document implementing PageModel.
 # - raster: GUI-agnostic page-bitmap helpers (sample_background), shared by the
 #   widget's overlay and our export code.
-# - pdfium: render core (still used directly by export.rs for vector export/tests).
-#   See its CLAUDE.md note on version pinning.
+# - platen: render core (pure Rust — no binary downloads; used directly by
+#   export.rs render-back tests).
 junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs" }
 junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs" }
 junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs" }
-junk-libs-pdfium = { git = "https://github.com/AberrantWolf/junk-libs" }
+junk-libs-platen = { git = "https://github.com/AberrantWolf/junk-libs" }
 keyring = "4.0.1"
 leptess = { version = "0.14.0", optional = true }
 lopdf = "0.41.0"
@@ -52,4 +52,4 @@ ocr = ["dep:leptess"]
 # junk-libs-egui-docview = { path = "../junk-libs/junk-libs-egui-docview" }
 # junk-libs-egui-pdfdoc = { path = "../junk-libs/junk-libs-egui-pdfdoc" }
 # junk-libs-raster = { path = "../junk-libs/junk-libs-raster" }
-# junk-libs-pdfium = { path = "../junk-libs/junk-libs-pdfium" }
+# junk-libs-platen = { path = "../junk-libs/junk-libs-platen" }

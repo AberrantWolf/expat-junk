@@ -53,8 +53,6 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       # The `ocr` feature is off by default (it links system Tesseract/Leptonica
       # at build time), so CI doesn't install those — it lints the default build.
-      # PDFium is vendored by junk-libs-pdfium into target/.../build/.../out, so the
-      # `target` cache above covers it — no separate vendor cache needed.
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:

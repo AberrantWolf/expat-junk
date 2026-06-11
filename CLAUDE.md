@@ -18,17 +18,12 @@ a module by replacing its stubs, not by re-architecting around them.
 
 ```bash
 cargo run                 # launch the egui app
-cargo build               # default build; build.rs vendors PDFium on first run (see below)
+cargo build               # default build (PDF rendering is pure Rust — no downloads)
 cargo build --features ocr   # also build the Tesseract OCR path (see deps below)
 cargo check               # fast type-check loop
 cargo test                # incl. the headless PDF render test (no display needed)
 cargo test renders_a_generated_pdf   # run that single test by name
 ```
-
-The first build compiles the `junk-libs-pdfium` dependency, whose `build.rs`
-downloads the matching PDFium binary (~a few MB) into this build's `OUT_DIR`. It
-needs network access once per target dir; subsequent builds are offline
-(idempotent — skips if the lib is present).
 
 ### Depending on junk-libs (git, not path)
 
@@ -49,11 +44,9 @@ path. Leave it commented for commits/CI (Cargo errors if the path is absent).
   runners). Keep the tree fmt- and clippy-clean or CI fails.
 - **`.github/workflows/release.yml`** — on a `v*` tag: builds the `expat-junk` GUI
   binary for linux-x64 / macos-x64 / macos-arm64 / windows-x64 and packages a native
-  bundle each (Linux **AppImage**, macOS **.app** zipped, Windows **zip**). Each bundle
-  ships the PDFium binary **next to where `junk-libs-pdfium::instance()` looks for it**
-  at runtime — `../lib` (AppImage), `../Frameworks` (.app), or beside the `.exe`
-  (Windows) — found by globbing the vendored `target/.../build/junk-libs-pdfium-*/out`
-  path and rpath-fixed (`patchelf` / `install_name_tool`). Bundle metadata + a
+  bundle each (Linux **AppImage**, macOS **.app** zipped, Windows **zip**). The binary is
+  self-contained (PDF rendering is pure Rust via `junk-libs-platen`), so bundles
+  carry no native library payload. Bundle metadata + a
   placeholder icon live in `assets/` (`Info.plist`, `entitlements.plist`,
   `expat-junk.desktop`, `icon.{svg,icns,ico}`, `icon-256*.png` — regenerate the raster
   formats from `icon.svg`). macOS signing/notarization is **gated on repo secrets**
@@ -88,39 +81,31 @@ The design was chosen deliberately; don't silently swap these out.
 
 `document → ui → translate → export`, with `config` supplying provider choice and keys.
 
-- **`junk-libs-pdfium`** (external crate, git dep on `github.com/AberrantWolf/junk-libs`) —
-  the GUI-agnostic render core, lifted out of this repo so print-junk can share it. Its own
-  `build.rs` vendors the matching PDFium binary into `OUT_DIR` (no setup in this repo).
-  `instance()` returns a process-wide `&'static Pdfium`, bound lazily with a system fallback.
-  **PDFium can only be initialized once per process** — a second bind fails with
-  `PdfiumLibraryBindingsAlreadyInitialized` — so always go through `instance()`, never bind
-  directly. `render_pdf()` rasterizes every page to RGBA *and* extracts the text layer as
-  `CharBox`es (via `fpdf_text` loose glyph bounds), flipping PDF's bottom-left coords into our
-  top-left page space. `render_page_bitmap()` renders a single page at a given scale (px/pt),
-  bitmap only — used by `Document::rerender_page` to re-render the current page crisply on zoom.
-  `quantize_zoom()` is currently unused. **Whole-render serialization:** `render_pdf` and
-  `render_page_bitmap` each hold a process-global `render_lock()` for their full duration. The
-  `thread_safe` crate feature only guards *individual* FFI calls, but a render is a *sequence*
-  (load → page → render → extract) over shared library state; letting two interleave corrupts it
-  and segfaults. The lock makes concurrent callers (e.g. parallel tests) safe at the cost of
-  render parallelism. To change PDFium versions, edit that crate (the `pdfium_NNNN` feature and
-  `build.rs`'s `PDFIUM_VERSION` together). The crate's render/text tests live with it;
-  `tests/pdfium_wiring.rs` here only guards that runtime binding survives being consumed as a dep.
+- **`junk-libs-platen`** (external crate, git dep on `github.com/AberrantWolf/junk-libs`) —
+  the GUI-agnostic render core, shared with print-junk. Pure Rust (the hayro engine), so there
+  is no binary to vendor, no `instance()`, and no process-global lock — every call is
+  self-contained and renders run in parallel freely. `render_pdf()` rasterizes every page to
+  RGBA *and* extracts the text layer as `CharBox`es (loose glyph cells, PDF's bottom-left
+  coords flipped into our top-left page space). `render_page_bitmap()` renders a single page at
+  a given scale (px/pt), bitmap only — used by `Document::rerender_page` to re-render the
+  current page crisply on zoom. Errors are typed (`PasswordRequired`, `Invalid`, …) and convert
+  into `anyhow` at call sites. The crate's render/text tests live with it; the engine is pinned
+  exactly (hayro `=0.7.x`) in that crate — bump it there, re-running its A/B suite.
 - **The PDF-view stack lives in three sibling `junk-libs` crates** (git deps), so the widget is
   reusable (print-junk can adopt it) and the layers stay decoupled:
   - **`junk-libs-egui-docview`** — the reusable, document-format-agnostic interactive widget
     (`DocView`) plus the seam it's driven through: the `PageModel` trait (the host's document,
     seen by the widget), the `RegionOverlay` trait + `OverlayCtx` (the host paints per-region
-    content), and the geometry types `Rect`/`RegionId`. **No pdfium, no ab_glyph** — pure egui.
+    content), and the geometry types `Rect`/`RegionId`. **No renderer, no ab_glyph** — pure egui.
   - **`junk-libs-egui-pdfdoc`** — a batteries-included `PageModel`: `Document`/`Page`/`Region`
-    + PDF/image loading (PDFium / `image`), `crop`, `region_text`, `rerender_page`. This is the
-    layer that pulls in `junk-libs-pdfium`.
+    + PDF/image loading (`junk-libs-platen` / `image`), `crop`, `region_text`, `rerender_page`.
+    This is the layer that pulls in the renderer.
   - **`junk-libs-raster`** — tiny `image`-only helper (`sample_background`, `PixelRect`) shared
     by the widget's `OverlayCtx::sample_background` and our `export.rs` (so the GUI-agnostic
-    backend never links egui and the widget never links pdfium).
+    backend never links egui and the widget never links the renderer).
 - **`document.rs`** — now just **re-exports** `Document`/`Region` from `junk-libs-egui-pdfdoc` and
   `Rect`/`RegionId` from `junk-libs-egui-docview`, so the rest of the app keeps saying
-  `crate::document::*`. `Document::open()` dispatches on extension (PDF → `pdfium::render_pdf`,
+  `crate::document::*`. `Document::open()` dispatches on extension (PDF → `platen::render_pdf`,
   image → `image` crate as one page); `Page::char_boxes` holds `(char, Rect)` from the text layer
   for snap-to-text selection and the native-text path. **`Rect` is in page coordinates (PDF
   points, top-left origin), never screen pixels** — the UI converts using its zoom; `CharBox` is
@@ -136,7 +121,7 @@ The design was chosen deliberately; don't silently swap these out.
   page↔screen transform is derived each frame from the displayed image rect, so it's correct at
   any zoom. **Crisp zoom:** each frame it computes a target render scale (`zoom × pixels_per_point`,
   quantized to 0.5 steps, clamped 1–6) and, when it differs from the current page bitmap's scale,
-  calls `PageModel::rerender_page` (→ `junk_libs_pdfium::render_page_bitmap`) so the raster matches
+  calls `PageModel::rerender_page` (→ `junk_libs_platen::render_page_bitmap`) so the raster matches
   the on-screen size instead of being upscaled. The texture rebuilds when the page or its render
   scale changes. Image sources can't re-render (raster), so they just display-scale. The re-render
   is synchronous on the UI thread (a brief hitch per zoom quantum at high res). The page lives in a
@@ -263,14 +248,6 @@ The design was chosen deliberately; don't silently swap these out.
 
 These are the surprises to watch for — the rest is pure Rust.
 
-- **PDFium**: bound dynamically at runtime by `junk-libs-pdfium`, so its Cargo feature
-  (`pdfium_7763`) **must match the vendored binary** or you get `LoadLibraryError: undefined
-  symbol FPDFText_*`. That crate's `build.rs` keeps them in lockstep (downloads `chromium/7763`).
-  To move versions, change BOTH the `pdfium_NNNN` feature and `PDFIUM_VERSION` *in that crate*,
-  to a number that exists as a tagged
-  [bblanchon release](https://github.com/bblanchon/pdfium-binaries/releases). Never use the
-  `pdfium_latest` (moving) or `pdfium_future` (needs an unreleased binary) features. This repo
-  no longer carries a `build.rs` of its own.
 - **Tesseract** (`leptess`, `ocr` feature): links the system Tesseract + Leptonica C
   libraries at **build** time (via `pkg-config` for `lept`/`tesseract`), so the default
   build leaves it off. To build `--features ocr` on Arch/CachyOS:

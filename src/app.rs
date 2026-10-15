@@ -21,23 +21,10 @@ use crate::export;
 use crate::ocr;
 use crate::project;
 use crate::secrets::Secrets;
-use crate::translate::{
-    GeminiVision, TesseractText, TextApi, TranslationRequest, TranslationResult, Translator,
-};
+use crate::translate::{GeminiVision, TesseractText, TextApi, TranslationRequest, Translator};
+use crate::translation::{Justify, RegionStyle, Rotate, SourceMethod, Translated};
 use crate::viewer::TranslationOverlay;
-use junk_libs_egui_docview::DocView;
-
-/// How a region's source text was obtained — shown as a badge so the user knows
-/// what is being sent to translate.
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum SourceMethod {
-    /// Pulled from the PDF text layer (`char_boxes`).
-    TextLayer,
-    /// Recognized locally with Tesseract (no text layer).
-    Ocr,
-    /// No text available; only the image was sent (the vision model reads it).
-    ImageOnly,
-}
+use junk_libs_egui_docview::{DocView, ViewState};
 
 impl SourceMethod {
     fn label(self) -> &'static str {
@@ -57,88 +44,22 @@ impl SourceMethod {
     }
 }
 
-/// Horizontal alignment for the overlaid translation text.
-#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum Justify {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
-
-/// 90° rotation for the overlaid text. English documents use both conventions:
-/// `Cw` (reads top-to-bottom, head tilted right) is the margin/spine/label norm
-/// and the default when rotating; `Ccw` (reads bottom-to-top, head tilted left)
-/// is the chart axis-label norm.
-#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum Rotate {
-    #[default]
-    None,
-    /// Clockwise — text reads top-to-bottom.
-    Cw,
-    /// Counter-clockwise — text reads bottom-to-top.
-    Ccw,
-}
-
-impl Rotate {
-    /// Whether the text is turned on its side (so the render buffer's width and
-    /// height are swapped before it's rotated back to fill the region).
-    pub fn is_sideways(self) -> bool {
-        !matches!(self, Rotate::None)
-    }
-}
-
-/// Per-region presentation overrides the user can tweak after translating. These
-/// persist with the project and drive both the live preview and the export, so
-/// what you set here is what gets baked into the output.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct RegionStyle {
-    /// User-edited replacement text. `None` means "use the machine translation"
-    /// (and keeps tracking it if the region is re-translated).
-    pub text: Option<String>,
-    /// Render the text rotated 90° (for vertical/sideways layouts).
-    pub rotate: Rotate,
-    /// Background fill override (sRGB). `None` auto-samples the page around the
-    /// region, matching the export's default background fill.
-    pub background: Option<[u8; 3]>,
-    pub justify: Justify,
-    /// Render the text in bold (700 weight) instead of regular (400).
-    #[serde(default)]
-    pub bold: bool,
-    /// Explicit font size in points. `None` auto-fits the largest size (up to the
-    /// region height) that fits the box; `Some` sets the starting size, still
-    /// shrunk to fit if the text would overflow.
-    #[serde(default)]
-    pub size_pt: Option<f32>,
-}
-
-/// A completed translation plus how its source text was obtained and any
-/// user presentation overrides.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Translated {
-    pub result: TranslationResult,
-    pub method: SourceMethod,
-    /// User tweaks to how the translation is rendered. `#[serde(default)]` keeps
-    /// projects saved before styling existed loadable.
-    #[serde(default)]
-    pub style: RegionStyle,
-}
-
-impl Translated {
-    /// The text to render: the user's edit if present, else the machine
-    /// translation.
-    pub fn display_text(&self) -> &str {
-        self.style
-            .text
-            .as_deref()
-            .unwrap_or(&self.result.translation)
-    }
-}
-
 /// An in-flight translation running on a background thread.
 struct Pending {
     region: RegionId,
+    rect: [f32; 4],
+    settings: Settings,
     rx: mpsc::Receiver<Result<Translated>>,
+}
+
+enum Loaded {
+    Document(Document),
+    Project(Box<project::Project>, Document),
+}
+
+struct Loading {
+    path: PathBuf,
+    rx: mpsc::Receiver<Result<Loaded>>,
 }
 
 /// A menu/toolbar/shortcut action, executed after the panels render.
@@ -172,12 +93,15 @@ pub struct App {
     /// Persistent cache so repeat translations are free. Shared with the worker.
     cache: Arc<Mutex<TranslationCache>>,
     pending: Option<Pending>,
+    loading: Option<Loading>,
+    exporting: Option<mpsc::Receiver<Result<()>>>,
     /// Regions queued for batch translation ("Translate all"), processed one at
     /// a time through `pending`.
     queue: VecDeque<RegionId>,
     error: Option<String>,
     /// The shared interactive page-view widget (zoom/pan/region editing).
     doc_view: DocView,
+    view_state: ViewState,
     /// Translation-overlay state (fonts + per-region patch cache) painted onto the
     /// page by the widget.
     overlay: TranslationOverlay,
@@ -205,9 +129,12 @@ impl App {
             results: HashMap::new(),
             cache: Arc::new(Mutex::new(TranslationCache::load())),
             pending: None,
+            loading: None,
+            exporting: None,
             queue: VecDeque::new(),
             error: None,
             doc_view: DocView::default(),
+            view_state: ViewState::default(),
             overlay: TranslationOverlay::default(),
             show_translations: true,
             secrets: Secrets::load(),
@@ -233,9 +160,12 @@ impl eframe::App for App {
             results,
             cache,
             pending,
+            loading,
+            exporting,
             queue,
             error,
             doc_view,
+            view_state,
             overlay,
             show_translations,
             secrets,
@@ -244,26 +174,118 @@ impl eframe::App for App {
             title,
         } = self;
 
+        if let Some(rx) = exporting.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    *error = result.err().map(|e| format!("Exporting PDF: {e:#}"));
+                    *exporting = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *error = Some("PDF export worker stopped".into());
+                    *exporting = None;
+                }
+            }
+        }
+
+        let load_result = loading.as_ref().and_then(|load| match load.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("document loader stopped")))
+            }
+        });
+        if let Some(result) = load_result {
+            let path = loading.take().expect("load result has a job").path;
+            match result {
+                Ok(loaded) => {
+                    match loaded {
+                        Loaded::Document(doc) => {
+                            *document = Some(doc);
+                            *source_path = Some(path);
+                            *project_path = None;
+                            *current_page = 0;
+                            settings.context.clear();
+                            results.clear();
+                        }
+                        Loaded::Project(proj, doc) => {
+                            *current_page =
+                                proj.current_page.min(doc.pages.len().saturating_sub(1));
+                            *document = Some(doc);
+                            *source_path = Some(proj.source_path);
+                            *project_path = Some(path);
+                            *results = proj.results;
+                            settings.source_lang = proj.source_lang;
+                            settings.reading_direction = proj.reading_direction;
+                            settings.target_lang = proj.target_lang;
+                            settings.backend = proj.backend;
+                            settings.context = proj.context;
+                            settings.save();
+                        }
+                    }
+                    *selected = None;
+                    *error = None;
+                    *pending = None;
+                    queue.clear();
+                    *dirty = false;
+                    doc_view.invalidate_document();
+                    *view_state = ViewState::default();
+                    overlay.reset();
+                }
+                Err(e) => *error = Some(format!("Opening document: {e:#}")),
+            }
+        }
+        if loading.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Opening document…");
+            });
+            ui.disable();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        if let Some(doc) = document.as_mut() {
+            if let Err(e) = doc.poll_render() {
+                *error = Some(format!("Rendering page: {e:#}"));
+            }
+            if doc.is_rendering() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+
         // --- collect a finished translation, if any --------------------------
         let mut clear_pending = false;
         if let Some(p) = pending.as_mut() {
             match p.rx.try_recv() {
                 Ok(Ok(mut translated)) => {
-                    // Re-translating a region keeps the user's presentation
-                    // overrides (rotation, background, alignment, edited text).
-                    if let Some(prev) = results.get(&p.region) {
-                        translated.style = prev.style.clone();
+                    if !pending_is_current(p, document.as_ref(), settings) {
+                        *error = Some(
+                            "Region or translation settings changed; discarded the old result."
+                                .into(),
+                        );
+                        queue.clear();
+                        clear_pending = true;
+                    } else {
+                        // Re-translating a region keeps the user's presentation
+                        // overrides (rotation, background, alignment, edited text).
+                        if let Some(prev) = results.get(&p.region) {
+                            translated.style = prev.style.clone();
+                        }
+                        results.insert(p.region, translated);
+                        *dirty = true;
+                        clear_pending = true;
                     }
-                    results.insert(p.region, translated);
-                    *dirty = true;
-                    clear_pending = true;
                 }
                 Ok(Err(e)) => {
                     *error = Some(format!("{e:#}"));
                     queue.clear(); // abort any batch rather than repeat the failure
                     clear_pending = true;
                 }
-                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50))
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     *error = Some("translation worker stopped unexpectedly".to_string());
                     queue.clear();
@@ -275,7 +297,17 @@ impl eframe::App for App {
             *pending = None;
         }
 
-        let mut action: Option<Action> = None;
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        let has_unsaved_work =
+            *dirty || pending.is_some() || exporting.is_some() || !queue.is_empty();
+        if close_requested && has_unsaved_work {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let mut action: Option<Action> = if close_requested && has_unsaved_work {
+            Some(Action::Quit)
+        } else {
+            None
+        };
 
         // Count regions that still need translating (for the batch menu item).
         let untranslated = document
@@ -283,7 +315,7 @@ impl eframe::App for App {
             .map(|d| {
                 d.regions
                     .iter()
-                    .filter(|r| !results.contains_key(&r.id))
+                    .filter(|r| !results.get(&r.id).is_some_and(|t| t.is_current(settings)))
                     .count()
             })
             .unwrap_or(0);
@@ -311,7 +343,10 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(document.is_some(), egui::Button::new("Export translated…"))
+                        .add_enabled(
+                            document.is_some() && exporting.is_none(),
+                            egui::Button::new("Export translated…"),
+                        )
                         .clicked()
                     {
                         action = Some(Action::Export);
@@ -362,14 +397,23 @@ impl eframe::App for App {
         // Translation controls (language pickers, the Translate button) live here
         // so the bar above the document holds only page/zoom (PDF) controls.
         action = action.or(info_panel(
-            ui, settings, document, results, pending, *selected, dirty, error,
+            ui,
+            settings,
+            document,
+            results,
+            pending,
+            exporting.is_some(),
+            *selected,
+            dirty,
+            error,
         ));
 
         // --- central canvas --------------------------------------------------
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(doc) = document.as_mut() {
                 let mut frame = overlay.frame(results, *show_translations);
-                let edited = doc_view.show(ui, doc, current_page, selected, &mut frame, |ui| {
+                view_state.page_index = *current_page;
+                let output = doc_view.show(ui, doc, view_state, selected, &mut frame, |ui| {
                     // Host control: the translation-overlay toggle, in the viewer bar.
                     ui.separator();
                     ui.add_enabled_ui(!results.is_empty(), |ui| {
@@ -386,8 +430,22 @@ impl eframe::App for App {
                 });
                 // `frame`'s borrow of `overlay` ends here (last used above), so we
                 // can prune the patch cache for regions whose translations are gone.
-                overlay.prune(results);
-                if edited {
+                if output.edited {
+                    doc.clamp_regions();
+                }
+                if doc.is_rendering() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                results.retain(|id, _| doc.regions.iter().any(|r| r.id == *id));
+                let page_regions = doc
+                    .regions
+                    .iter()
+                    .filter(|r| r.page == view_state.page_index)
+                    .map(|r| r.id)
+                    .collect();
+                overlay.prune(results, &page_regions);
+                *current_page = view_state.page_index;
+                if output.edited || output.page_changed {
                     *dirty = true;
                 }
             } else {
@@ -397,10 +455,14 @@ impl eframe::App for App {
             }
         });
 
-        settings_window(&ctx, show_settings, settings, secrets, api_key_input);
+        if loading.is_none()
+            && settings_window(&ctx, show_settings, settings, secrets, api_key_input, error)
+        {
+            *dirty |= document.is_some();
+        }
 
         // Keyboard shortcuts (only if no menu/toolbar action already fired).
-        if action.is_none() {
+        if action.is_none() && loading.is_none() {
             action = ctx.input(|i| {
                 if i.modifiers.command && i.key_pressed(egui::Key::S) {
                     Some(Action::SaveProject)
@@ -414,6 +476,25 @@ impl eframe::App for App {
             });
         }
 
+        if (*dirty || pending.is_some() || exporting.is_some() || !queue.is_empty())
+            && matches!(
+                action,
+                Some(Action::OpenDoc | Action::OpenProject | Action::Quit)
+            )
+        {
+            let discard = rfd::MessageDialog::new()
+                .set_title("Unsaved project")
+                .set_description(
+                    "Discard unsaved changes and pending work? Cancel and save the project first to keep your work.",
+                )
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show();
+            if discard != rfd::MessageDialogResult::Ok {
+                action = None;
+            }
+        }
+
         // --- execute the action ----------------------------------------------
         match action {
             None => {}
@@ -422,22 +503,9 @@ impl eframe::App for App {
                     .add_filter("Documents", &["pdf", "png", "jpg", "jpeg", "webp", "tiff"])
                     .pick_file()
                 {
-                    match Document::open(&path) {
-                        Ok(doc) => {
-                            *document = Some(doc);
-                            *source_path = Some(path);
-                            *project_path = None;
-                            *current_page = 0;
-                            *selected = None;
-                            results.clear();
-                            *error = None;
-                            *pending = None;
-                            *dirty = false;
-                            doc_view.reset();
-                            overlay.reset();
-                        }
-                        Err(e) => *error = Some(format!("{e:#}")),
-                    }
+                    *pending = None;
+                    queue.clear();
+                    *loading = Some(start_loading(path, false, &ctx));
                 }
             }
             Some(Action::OpenProject) => {
@@ -445,29 +513,9 @@ impl eframe::App for App {
                     .add_filter("expat-junk project", &[project::EXTENSION])
                     .pick_file()
                 {
-                    let loaded = project::Project::load(&path)
-                        .and_then(|p| project::open_document(&p).map(|d| (p, d)));
-                    match loaded {
-                        Ok((proj, doc)) => {
-                            let last = doc.pages.len().saturating_sub(1);
-                            *current_page = proj.current_page.min(last);
-                            *document = Some(doc);
-                            *source_path = Some(proj.source_path);
-                            *project_path = Some(path);
-                            *selected = None;
-                            *results = proj.results;
-                            settings.source_lang = proj.source_lang;
-                            settings.target_lang = proj.target_lang;
-                            settings.backend = proj.backend;
-                            settings.save();
-                            *error = None;
-                            *pending = None;
-                            *dirty = false;
-                            doc_view.reset();
-                            overlay.reset();
-                        }
-                        Err(e) => *error = Some(format!("{e:#}")),
-                    }
+                    *pending = None;
+                    queue.clear();
+                    *loading = Some(start_loading(path, true, &ctx));
                 }
             }
             Some(Action::SaveProject) => save_project(
@@ -506,24 +554,47 @@ impl eframe::App for App {
                         if path.extension().is_none() {
                             path.set_extension("pdf");
                         }
-                        match export::export(doc, src, results, &path) {
-                            Ok(()) => *error = None,
-                            Err(e) => *error = Some(format!("{e:#}")),
+                        if exporting.is_none() {
+                            let snapshot = doc.snapshot();
+                            let results = results.clone();
+                            let src = src.clone();
+                            let (tx, rx) = mpsc::channel();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(export::export(&snapshot, &src, &results, &path));
+                                repaint.request_repaint();
+                            });
+                            *exporting = Some(rx);
                         }
                     }
                 }
             }
-            Some(Action::Quit) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Some(Action::Quit) => {
+                *pending = None;
+                queue.clear();
+                *dirty = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Some(Action::Translate) => {
                 if let Some(id) = *selected {
-                    start_translation(id, settings, document, secrets, cache, pending, error);
+                    start_translation(
+                        id,
+                        settings,
+                        document,
+                        secrets,
+                        cache,
+                        pending,
+                        error,
+                        results.contains_key(&id),
+                        &ctx,
+                    );
                 }
             }
             Some(Action::TranslateAll) => {
                 queue.clear();
                 if let Some(doc) = document.as_ref() {
                     for r in &doc.regions {
-                        if !results.contains_key(&r.id) {
+                        if !results.get(&r.id).is_some_and(|t| t.is_current(settings)) {
                             queue.push_back(r.id);
                         }
                     }
@@ -533,6 +604,10 @@ impl eframe::App for App {
                 if let (Some(id), Some(doc)) = (*selected, document.as_mut()) {
                     doc.remove_region(id);
                     results.remove(&id);
+                    queue.retain(|queued| *queued != id);
+                    if pending.as_ref().is_some_and(|p| p.region == id) {
+                        *pending = None;
+                    }
                     *selected = None;
                     *dirty = true;
                 }
@@ -540,6 +615,8 @@ impl eframe::App for App {
             Some(Action::ClearTranslations) => {
                 *dirty = *dirty || !results.is_empty();
                 results.clear();
+                queue.clear();
+                *pending = None;
             }
             Some(Action::ToggleSettings) => *show_settings = !*show_settings,
         }
@@ -550,9 +627,11 @@ impl eframe::App for App {
                 let still_valid = document
                     .as_ref()
                     .is_some_and(|d| d.regions.iter().any(|r| r.id == next))
-                    && !results.contains_key(&next);
+                    && !results.get(&next).is_some_and(|t| t.is_current(settings));
                 if still_valid {
-                    start_translation(next, settings, document, secrets, cache, pending, error);
+                    start_translation(
+                        next, settings, document, secrets, cache, pending, error, false, &ctx,
+                    );
                     // If it couldn't even start (e.g. no API key), abort the batch.
                     if pending.is_none() {
                         queue.clear();
@@ -562,7 +641,7 @@ impl eframe::App for App {
             }
         }
         if pending.is_some() || !queue.is_empty() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // --- window title reflects the project + dirty state -----------------
@@ -590,12 +669,14 @@ fn info_panel(
     document: &Option<Document>,
     results: &mut HashMap<RegionId, Translated>,
     pending: &Option<Pending>,
+    exporting: bool,
     selected: Option<RegionId>,
     dirty: &mut bool,
     error: &Option<String>,
 ) -> Option<Action> {
     let mut action = None;
     egui::Panel::right("info").show_inside(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
         // Global translation status + language pickers (apply to every region).
         if pending.is_some() {
             ui.horizontal(|ui| {
@@ -603,6 +684,7 @@ fn info_panel(
                 ui.label("Translating…");
             });
         }
+        if exporting {ui.horizontal(|ui|{ui.spinner();ui.label("Exporting PDF…");});}
         if let Some(err) = error {
             ui.colored_label(egui::Color32::RED, err.as_str());
         }
@@ -612,11 +694,32 @@ fn info_panel(
         let src_name = crate::config::Language::name_for_ocr(&settings.source_lang).to_owned();
         if language_combo(ui, "Source (OCR)", "src_lang", &mut settings.source_lang, &src_name, |l| l.ocr) {
             settings.save();
+            *dirty |= document.is_some();
         }
+        ui.horizontal(|ui| {
+            use junk_libs_platen::reading_order::Direction;
+            ui.label("PDF reading order");
+            let previous = settings.reading_direction;
+            egui::ComboBox::from_id_salt("reading_direction").selected_text(match previous { Direction::Auto=>"Automatic",Direction::LeftToRight=>"Left to right",Direction::RightToLeft=>"Right to left",Direction::VerticalRightToLeft=>"Vertical Japanese" }).show_ui(ui,|ui| {
+                for (direction,label) in [(Direction::Auto,"Automatic"),(Direction::LeftToRight,"Left to right"),(Direction::RightToLeft,"Right to left"),(Direction::VerticalRightToLeft,"Vertical Japanese")] {
+                    ui.selectable_value(&mut settings.reading_direction,direction,label);
+                }
+            });
+            if previous!=settings.reading_direction {settings.save();*dirty|=document.is_some();}
+        });
         let tgt_name = crate::config::Language::name_for_iso(&settings.target_lang).to_owned();
         if language_combo(ui, "Target", "tgt_lang", &mut settings.target_lang, &tgt_name, |l| l.iso) {
             settings.save();
+            *dirty |= document.is_some();
         }
+        ui.separator();
+        ui.collapsing("Document context / terminology", |ui| {
+            ui.small("Used by Gemini and DeepL. Include the document type, intended tone, or terms to preserve.");
+            if ui.add(egui::TextEdit::multiline(&mut settings.context).desired_rows(3)).changed() {
+                settings.save();
+                *dirty |= document.is_some();
+            }
+        });
         ui.separator();
 
         ui.heading("Region");
@@ -626,6 +729,12 @@ fn info_panel(
             Some(id) if results.contains_key(&id) => {
                 let t = results.get_mut(&id).expect("checked by guard");
                 badge(ui, t.method);
+                if !t.is_current(settings) {
+                    ui.colored_label(egui::Color32::YELLOW, "Translation uses previous language, provider, or context. Re-translate to update it.");
+                }
+                if let Some(previous) = &t.settings {
+                    ui.small(format!("{} → {}", previous.backend.provider_label(), previous.target_lang));
+                }
                 ui.separator();
 
                 // Reference text: the source and the raw machine translation.
@@ -772,7 +881,7 @@ fn info_panel(
                 if let Some(doc) = document.as_ref()
                     && let Some(reg) = doc.regions.iter().find(|r| r.id == id)
                 {
-                    let text = doc.region_text(id);
+                    let text = doc.region_text_with_direction(id,settings.reading_direction);
                     if !text.trim().is_empty() {
                         badge(ui, SourceMethod::TextLayer);
                         ui.separator();
@@ -804,6 +913,7 @@ fn info_panel(
                 ui.label("Drag on the page to draw a region, or click one to select it.");
             }
         }
+        });
     });
     action
 }
@@ -868,7 +978,9 @@ fn settings_window(
     settings: &mut Settings,
     secrets: &mut Secrets,
     api_key_input: &mut String,
-) {
+    error: &mut Option<String>,
+) -> bool {
+    let before = settings.clone();
     egui::Window::new("Settings")
         .open(open)
         .resizable(false)
@@ -884,7 +996,7 @@ fn settings_window(
                     }
                     for (label, api, ready) in [
                         ("Google Translate", TextApi::Google, true),
-                        ("DeepL", TextApi::DeepL, false),
+                        ("DeepL", TextApi::DeepL, true),
                         ("Kagi", TextApi::Kagi, false),
                     ] {
                         let sel = matches!(&settings.backend, Backend::TesseractText { api: a } if *a == api);
@@ -907,7 +1019,7 @@ fn settings_window(
                     ui.label("Model");
                     model_changed = ui
                         .add(
-                            egui::TextEdit::singleline(model).hint_text("gemini-flash-lite-latest"),
+                            egui::TextEdit::singleline(model).hint_text("gemini-3.5-flash-lite"),
                         )
                         .changed();
                 });
@@ -927,7 +1039,10 @@ fn settings_window(
                         .hint_text("paste API key"),
                 );
                 if ui.button("Save").clicked() && !api_key_input.is_empty() {
-                    secrets.set(provider, std::mem::take(api_key_input));
+                    match secrets.set(provider, api_key_input.clone()) {
+                        Ok(()) => { api_key_input.clear(); *error = None; }
+                        Err(e) => *error = Some(format!("Saving API key: {e:#}")),
+                    }
                 }
             });
             if secrets.get(provider).is_some() {
@@ -944,6 +1059,11 @@ fn settings_window(
             ui.separator();
             ui.small("Keys are stored in secrets.json in your config dir (owner-only), not in git.");
         });
+    let changed = *settings != before;
+    if changed {
+        api_key_input.clear();
+    }
+    changed
 }
 
 /// Save the session as a project file, prompting for a path when needed.
@@ -982,12 +1102,21 @@ fn save_project(
     if path.extension().is_none() {
         path.set_extension(project::EXTENSION);
     }
+    if std::fs::canonicalize(&path)
+        .ok()
+        .is_some_and(|p| std::fs::canonicalize(src).ok().as_ref() == Some(&p))
+    {
+        *error = Some("Project destination must differ from the source document.".into());
+        return;
+    }
 
     let proj = project::build(
         src.clone(),
         current_page,
         settings.source_lang.clone(),
+        settings.reading_direction,
         settings.target_lang.clone(),
+        settings.context.clone(),
         settings.backend.clone(),
         doc,
         results.clone(),
@@ -1005,6 +1134,7 @@ fn save_project(
 /// Crop the selected region and kick off a background translation. The worker
 /// resolves the source text (text layer → OCR), checks/populates the shared
 /// cache, and calls the translator. All errors land in `error`.
+#[allow(clippy::too_many_arguments)]
 fn start_translation(
     id: RegionId,
     settings: &Settings,
@@ -1013,95 +1143,127 @@ fn start_translation(
     cache: &Arc<Mutex<TranslationCache>>,
     pending: &mut Option<Pending>,
     error: &mut Option<String>,
+    bypass_cache: bool,
+    ctx: &egui::Context,
 ) {
+    if pending.is_some() {
+        return;
+    }
     let Some(doc) = document.as_ref() else {
         return;
     };
-    let crop = match doc.crop(id) {
-        Ok(c) => c,
+    let Some(region) = doc.regions.iter().find(|r| r.id == id) else {
+        return;
+    };
+    let rect = rect_signature(region.rect);
+    let input = match doc.region_input(id) {
+        Ok(input) => input,
         Err(e) => {
             *error = Some(format!("{e:#}"));
             return;
         }
     };
-    let text_layer = {
-        let t = doc.region_text(id);
-        (!t.trim().is_empty()).then_some(t)
-    };
-    let translator = match build_translator(settings, secrets) {
-        Ok(t) => t,
-        Err(e) => {
-            *error = Some(format!("{e:#}"));
-            return;
-        }
-    };
+    // A cached result remains available offline, without a configured key.
+    let translator = build_translator(settings, secrets);
 
-    let (provider, model) = backend_ids(&settings.backend);
-    let target_lang = settings.target_lang.clone();
-    let source_lang = settings.source_lang.clone();
+    let worker_settings = settings.clone();
     let cache = Arc::clone(cache);
+    let repaint = ctx.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let outcome = run_translation(
-            translator,
-            crop,
-            text_layer,
-            provider,
-            model,
-            target_lang,
-            source_lang,
-            cache,
-        );
+        let outcome = input
+            .resolve_with_direction(2.0, worker_settings.reading_direction)
+            .and_then(|(crop, text)| {
+                let text_layer = (!text.trim().is_empty()).then_some(text);
+                run_translation(
+                    translator,
+                    crop,
+                    text_layer,
+                    worker_settings,
+                    bypass_cache,
+                    cache,
+                )
+            });
         let _ = tx.send(outcome);
+        repaint.request_repaint();
     });
-    *pending = Some(Pending { region: id, rx });
+    *pending = Some(Pending {
+        region: id,
+        rect,
+        settings: settings.clone(),
+        rx,
+    });
     *error = None;
 }
 
 /// Worker body (runs off the UI thread): resolve source text, hit the cache, or
 /// translate and cache the result.
-#[allow(clippy::too_many_arguments)]
 fn run_translation(
-    translator: Box<dyn Translator + Send>,
+    translator: Result<Box<dyn Translator + Send>>,
     crop: image::RgbaImage,
     text_layer: Option<String>,
-    provider: &'static str,
-    model: String,
-    target_lang: String,
-    source_lang: String,
+    settings: Settings,
+    bypass_cache: bool,
     cache: Arc<Mutex<TranslationCache>>,
 ) -> Result<Translated> {
+    let (provider, model) = backend_ids(&settings.backend);
+    let (target_lang, source_lang, context) = (
+        &settings.target_lang,
+        &settings.source_lang,
+        &settings.context,
+    );
     let (source_text, method) = match text_layer {
         Some(t) => (Some(t), SourceMethod::TextLayer),
-        None => match ocr::recognize(&crop, &source_lang) {
+        None => match ocr::recognize(&crop, source_lang) {
             Ok(t) if !t.trim().is_empty() => (Some(t), SourceMethod::Ocr),
+            Err(e) if provider != "gemini" => {
+                return Err(e.context(
+                    "Reading source text: use Gemini for vision, or enable/configure local OCR",
+                ));
+            }
             _ => (None, SourceMethod::ImageOnly),
         },
     };
 
-    let key = match &source_text {
-        Some(t) => cache::key_text(provider, &model, &target_lang, t),
-        None => cache::key_pixels(provider, &model, &target_lang, &crop),
-    };
-    if let Some(result) = cache.lock().unwrap().get(&key) {
+    let key = cache::key_request(
+        provider,
+        &model,
+        target_lang,
+        source_lang,
+        if provider == "google" { "" } else { context },
+        source_text.as_deref(),
+        (provider == "gemini").then_some(&crop),
+    );
+    if !bypass_cache
+        && let Some(result) = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("translation cache lock poisoned"))?
+            .get(&key)
+    {
         return Ok(Translated {
             result,
             method,
             style: RegionStyle::default(),
+            settings: Some(settings),
         });
     }
 
     let req = TranslationRequest {
         image: &crop,
         source_text: source_text.as_deref(),
-        target_lang: &target_lang,
+        target_lang,
+        context,
     };
-    let result = translator.translate(&req)?;
-    cache.lock().unwrap().insert(key, result.clone());
+    let result = translator?.translate(&req)?;
+    cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("translation cache lock poisoned"))?
+        .insert(key, result.clone());
     Ok(Translated {
         result,
         method,
         style: RegionStyle::default(),
+        settings: Some(settings),
     })
 }
 
@@ -1109,7 +1271,7 @@ fn run_translation(
 fn backend_ids(backend: &Backend) -> (&'static str, String) {
     match backend {
         Backend::GeminiVision { model } => ("gemini", model.clone()),
-        Backend::TesseractText { api } => ("tesseract", format!("{api:?}")),
+        Backend::TesseractText { api } => (backend.secret_id(), format!("{api:?}")),
     }
 }
 
@@ -1123,4 +1285,134 @@ fn build_translator(settings: &Settings, secrets: &Secrets) -> Result<Box<dyn Tr
         }),
         Backend::TesseractText { api } => Box::new(TesseractText { api: *api, api_key }),
     })
+}
+
+fn rect_signature(rect: crate::document::Rect) -> [f32; 4] {
+    [rect.x, rect.y, rect.w, rect.h]
+}
+
+fn pending_is_current(p: &Pending, doc: Option<&Document>, settings: &Settings) -> bool {
+    p.settings == *settings
+        && doc.is_some_and(|doc| {
+            doc.regions
+                .iter()
+                .any(|r| r.id == p.region && rect_signature(r.rect) == p.rect)
+        })
+}
+
+fn start_loading(path: PathBuf, is_project: bool, ctx: &egui::Context) -> Loading {
+    let (tx, rx) = mpsc::channel();
+    let source = path.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = if is_project {
+            project::Project::load(&source)
+                .and_then(|p| project::open_document(&p).map(|d| Loaded::Project(Box::new(p), d)))
+        } else {
+            Document::open(&source).map(Loaded::Document)
+        };
+        let _ = tx.send(result);
+        repaint.request_repaint();
+    });
+    Loading { path, rx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Rect;
+    use crate::translate::TranslationResult;
+
+    struct Stub;
+    impl Translator for Stub {
+        fn translate(&self, _: &TranslationRequest) -> Result<TranslationResult> {
+            Ok(result("fresh"))
+        }
+    }
+    fn result(text: &str) -> TranslationResult {
+        TranslationResult {
+            source_text: "source".into(),
+            translation: text.into(),
+            alternatives: vec![],
+            explanation: None,
+        }
+    }
+
+    #[test]
+    fn retranslate_bypasses_cached_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let crop = image::RgbaImage::new(8, 8);
+        // This test must never load or write the user's real cache.
+        let cache = Arc::new(Mutex::new(TranslationCache::with_path(Some(
+            dir.path().join("cache.json"),
+        ))));
+        let key = cache::key_request("google", "Google", "en", "eng", "", Some("source"), None);
+        cache.lock().unwrap().insert(key, result("cached"));
+        let run = |bypass| {
+            run_translation(
+                Ok(Box::new(Stub)),
+                crop.clone(),
+                Some("source".into()),
+                Settings {
+                    backend: Backend::TesseractText {
+                        api: TextApi::Google,
+                    },
+                    ..Settings::default()
+                },
+                bypass,
+                Arc::clone(&cache),
+            )
+            .unwrap()
+        };
+        let cached_without_key = run_translation(
+            Err(anyhow::anyhow!("missing API key")),
+            crop.clone(),
+            Some("source".into()),
+            Settings {
+                backend: Backend::TesseractText {
+                    api: TextApi::Google,
+                },
+                ..Settings::default()
+            },
+            false,
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        assert_eq!(cached_without_key.result.translation, "cached");
+        assert_eq!(run(false).result.translation, "cached");
+        assert_eq!(run(true).result.translation, "fresh");
+        assert_eq!(run(false).result.translation, "fresh");
+    }
+
+    #[test]
+    fn pending_result_rejects_deleted_moved_and_reconfigured_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        image::RgbaImage::new(100, 100).save(&path).unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        let rect = Rect {
+            x: 1.0,
+            y: 2.0,
+            w: 20.0,
+            h: 20.0,
+        };
+        let id = doc.add_region(0, rect);
+        let settings = Settings::default();
+        let (_, rx) = mpsc::channel();
+        let pending = Pending {
+            region: id,
+            rect: rect_signature(rect),
+            settings: settings.clone(),
+            rx,
+        };
+        assert!(pending_is_current(&pending, Some(&doc), &settings));
+        let mut changed = settings.clone();
+        changed.target_lang = "ja".into();
+        assert!(!pending_is_current(&pending, Some(&doc), &changed));
+        doc.region_mut(id).unwrap().rect.x += 1.0;
+        assert!(!pending_is_current(&pending, Some(&doc), &settings));
+        doc.remove_region(id);
+        assert!(!pending_is_current(&pending, Some(&doc), &settings));
+        assert!(!pending_is_current(&pending, None, &settings));
+    }
 }

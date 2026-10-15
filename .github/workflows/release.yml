@@ -106,6 +106,8 @@ jobs:
           # self-contained, nothing to bundle into Frameworks.
           cp "target/${{ matrix.target }}/release/expat-junk" "$APP/Contents/MacOS/"
           cp "assets/icon.icns" "$APP/Contents/Resources/AppIcon.icns"
+          mkdir -p "$APP/Contents/Resources/Licenses"
+          cp THIRD-PARTY.md assets/fonts/*OFL.txt "$APP/Contents/Resources/Licenses/"
 
           # Substitute version into Info.plist
           sed "s/\${VERSION}/${VERSION#v}/g" assets/Info.plist > "$APP/Contents/Info.plist"
@@ -173,6 +175,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/expat-junk" "$APPDIR/usr/bin/"
           cp "assets/expat-junk.desktop" "$APPDIR/"
           cp "assets/icon-256.png" "$APPDIR/expat-junk.png"
+          mkdir -p "$APPDIR/usr/share/licenses/expat-junk"
+          cp THIRD-PARTY.md assets/fonts/*OFL.txt "$APPDIR/usr/share/licenses/expat-junk/"
 
           # Create AppRun symlink
           ln -s usr/bin/expat-junk "$APPDIR/AppRun"
@@ -197,6 +201,9 @@ jobs:
           # The render engine is pure Rust (junk-libs-platen) — the .exe is
           # self-contained, no DLL to ship alongside it.
           Copy-Item "target\${{ matrix.target }}\release\expat-junk.exe" "$GuiDir\"
+          New-Item -ItemType Directory -Path "$GuiDir\Licenses"
+          Copy-Item "THIRD-PARTY.md" "$GuiDir\Licenses\"
+          Copy-Item "assets\fonts\*OFL.txt" "$GuiDir\Licenses\"
           Compress-Archive -Path "$GuiDir\*" -DestinationPath "${GuiDir}.zip"
           echo "GUI_ARCHIVE=${GuiDir}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 

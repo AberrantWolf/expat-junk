@@ -5,7 +5,6 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ab_glyph = "0.2.32"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 directories = "6.0.0"
@@ -20,13 +19,14 @@ image = "0.25.10"
 # - egui-pdfdoc: the batteries-included platen-backed Document implementing PageModel.
 # - raster: GUI-agnostic page-bitmap helpers (sample_background), shared by the
 #   widget's overlay and our export code.
+# - text: Unicode shaping, bidi layout, bundled fallback fonts and rasterization.
 # - platen: render core (pure Rust — no binary downloads; used directly by
 #   export.rs render-back tests).
-junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs" }
-junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs" }
-junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs" }
-junk-libs-platen = { git = "https://github.com/AberrantWolf/junk-libs" }
-keyring = "4.0.1"
+junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
+junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
+junk-libs-text = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
+junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
+junk-libs-platen = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
 leptess = { version = "0.14.0", optional = true }
 lopdf = "0.41.0"
 # `images` enables embedding rasters (from_dynamic_image takes raw RGBA, so no
@@ -37,7 +37,7 @@ rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
-thiserror = "2.0.18"
+tempfile = "3.27.0"
 
 [features]
 # OCR for the text-API path (Google/DeepL/Kagi). Off by default because leptess
@@ -52,4 +52,5 @@ ocr = ["dep:leptess"]
 # junk-libs-egui-docview = { path = "../junk-libs/junk-libs-egui-docview" }
 # junk-libs-egui-pdfdoc = { path = "../junk-libs/junk-libs-egui-pdfdoc" }
 # junk-libs-raster = { path = "../junk-libs/junk-libs-raster" }
+# junk-libs-text = { path = "../junk-libs/junk-libs-text" }
 # junk-libs-platen = { path = "../junk-libs/junk-libs-platen" }

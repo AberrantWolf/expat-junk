@@ -17,3 +17,16 @@ The full license text ships alongside the font at
 PDF rendering is pure Rust ([hayro](https://github.com/LaurenzV/hayro) via the
 `junk-libs-platen` crate, MIT/Apache-2.0) — an ordinary crate dependency like
 the rest, with no separately-licensed native component.
+
+### Multilingual Noto fallback fonts
+
+The shared `junk-libs-text` renderer bundles Noto Sans, Noto Sans Arabic,
+Noto Sans Hebrew, Noto Sans Devanagari and Noto Sans Thai. Expat Junk additionally
+bundles Noto Sans KR for Hangul coverage and retains Noto Sans JP for Japanese
+and Chinese. All are licensed under SIL Open Font License 1.1. The exact notices
+are copied into `assets/fonts/NotoSans*-OFL.txt` and included in release bundles.
+The fonts originate from the official [Google Fonts repository](https://github.com/google/fonts).
+
+Unicode shaping and rasterization use [COSMIC Text](https://github.com/pop-os/cosmic-text)
+(MIT OR Apache-2.0), with HarfRust, Unicode bidi/line-breaking and Swash through
+that crate. No installed system fonts or native shaping libraries are required.

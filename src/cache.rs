@@ -1,11 +1,7 @@
 //! Persistent translation cache.
 //!
-//! Re-translating the same region should be free: results are keyed by a stable
-//! hash of (provider, model, target language, region pixels) and persisted under
-//! the user's cache dir, so repeats are instant and don't spend API tokens. The
-//! key hashes the actual bytes sent to the provider — identical crops hit;
-//! visually different crops (different size/position) miss. (A future text-level
-//! cache keyed on detected source text could catch more.)
+//! Keys cover provider, model, prompt version, language, exact source text,
+//! and (for vision) the image. Whitespace is translation input, not discarded.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,7 +26,7 @@ impl TranslationCache {
     }
 
     /// Construct from an explicit path (or `None` for in-memory only).
-    fn with_path(path: Option<PathBuf>) -> Self {
+    pub(crate) fn with_path(path: Option<PathBuf>) -> Self {
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
@@ -55,29 +51,44 @@ impl TranslationCache {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            let _ = std::fs::write(path, json);
+            let _ = crate::persistence::write(path, &json);
         }
     }
 }
 
-/// Cache key from a region's **source text** — the preferred key: the same text
-/// hits regardless of how the region was drawn, sized, or rendered. Whitespace
-/// is collapsed so trivial layout differences don't cause misses.
-pub fn key_text(provider: &str, model: &str, lang: &str, text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    make_key(provider, model, lang, 't', |h| {
-        h.update(normalized.as_bytes())
-    })
-}
-
-/// Cache key from a region's **pixels** — fallback for pages with no text layer
-/// (images / scanned PDFs, until OCR lands).
-pub fn key_pixels(provider: &str, model: &str, lang: &str, image: &image::RgbaImage) -> String {
-    make_key(provider, model, lang, 'p', |h| {
-        h.update(image.width().to_le_bytes());
-        h.update(image.height().to_le_bytes());
-        h.update(image.as_raw());
-    })
+/// Key every input actually sent to the backend. Vision requests always include
+/// pixels, even when a text layer or OCR hint is available.
+pub fn key_request(
+    provider: &str,
+    model: &str,
+    lang: &str,
+    source_lang: &str,
+    context: &str,
+    text: Option<&str>,
+    image: Option<&image::RgbaImage>,
+) -> String {
+    make_key(
+        provider,
+        model,
+        lang,
+        if image.is_some() { 'p' } else { 't' },
+        |h| {
+            for part in [
+                crate::translate::PROMPT_VERSION,
+                source_lang,
+                context,
+                text.unwrap_or(""),
+            ] {
+                h.update((part.len() as u64).to_le_bytes());
+                h.update(part.as_bytes());
+            }
+            if let Some(image) = image {
+                h.update(image.width().to_le_bytes());
+                h.update(image.height().to_le_bytes());
+                h.update(image.as_raw());
+            }
+        },
+    )
 }
 
 /// Hash the (provider, model, lang) preamble plus a `kind`-tagged payload. The
@@ -114,56 +125,34 @@ mod tests {
     }
 
     #[test]
-    fn pixel_key_is_stable_and_content_sensitive() {
+    fn request_keys_cover_text_pixels_and_language() {
         let a = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
         let b = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 2, 3, 255]));
-        assert_eq!(
-            key_pixels("gemini", "m", "en", &a),
-            key_pixels("gemini", "m", "en", &a)
+        let key =
+            |text, image, source| key_request("gemini", "m", "en", source, "", Some(text), image);
+        assert_eq!(key("hello", Some(&a), "eng"), key("hello", Some(&a), "eng"));
+        assert_ne!(key("hello", Some(&a), "eng"), key("hello", Some(&b), "eng"));
+        assert_ne!(key("hello", Some(&a), "eng"), key("hello", Some(&a), "jpn"));
+        assert_ne!(key("a b", None, "eng"), key("a\nb", None, "eng"));
+        assert_ne!(key("hello", None, "eng"), key("hello", Some(&a), "eng"));
+        assert_ne!(
+            key("hello", None, "eng"),
+            key_request("gemini", "m", "en", "eng", "form", Some("hello"), None)
         );
         assert_ne!(
-            key_pixels("gemini", "m", "en", &a),
-            key_pixels("gemini", "m", "en", &b)
+            key("hello", None, "eng"),
+            key_request("gemini", "n", "en", "eng", "", Some("hello"), None)
         );
         assert_ne!(
-            key_pixels("gemini", "m", "en", &a),
-            key_pixels("gemini", "m", "fr", &a)
-        );
-        assert_ne!(
-            key_pixels("gemini", "m", "en", &a),
-            key_pixels("gemini", "n", "en", &a)
-        );
-    }
-
-    #[test]
-    fn text_key_collapses_whitespace_and_stays_distinct() {
-        // Whitespace-insensitive: same words hit regardless of spacing/newlines.
-        assert_eq!(
-            key_text("gemini", "m", "en", "Hello   world"),
-            key_text("gemini", "m", "en", "Hello world\n"),
-        );
-        // …but sensitive to the actual text and language.
-        assert_ne!(
-            key_text("gemini", "m", "en", "Hello"),
-            key_text("gemini", "m", "en", "Goodbye"),
-        );
-        assert_ne!(
-            key_text("gemini", "m", "en", "Hello"),
-            key_text("gemini", "m", "fr", "Hello"),
-        );
-        // Text and pixel keys live in separate namespaces — never collide.
-        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
-        assert_ne!(
-            key_text("gemini", "m", "en", "Hello"),
-            key_pixels("gemini", "m", "en", &img),
+            key("hello", None, "eng"),
+            key_request("gemini", "m", "ja", "eng", "", Some("hello"), None)
         );
     }
 
     #[test]
     fn round_trips_through_disk() {
-        let dir = std::env::temp_dir().join("expat-junk-cache-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("translations.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("translations.json");
 
         let mut cache = TranslationCache::with_path(Some(path.clone()));
         assert!(cache.get("k").is_none());
@@ -172,7 +161,5 @@ mod tests {
         // A fresh instance reads the persisted entry back.
         let reloaded = TranslationCache::with_path(Some(path.clone()));
         assert_eq!(reloaded.get("k").unwrap().translation, "hello");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

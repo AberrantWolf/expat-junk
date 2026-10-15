@@ -18,8 +18,8 @@ way more than it's worth for "professional" tools or translation.
 > Working today: open PDFs/images, draw / zoom / page through and edit
 > translation regions, translate via **Gemini (vision)** or **Google Cloud
 > Translation** with a persistent token-saving cache, save and resume your work
-> as a project file, and export a translated PDF. DeepL and Kagi providers are
-> planned.
+> as a project file, and export a translated PDF. DeepL is also supported; Kagi
+> is planned.
 
 ---
 
@@ -29,10 +29,14 @@ way more than it's worth for "professional" tools or translation.
   directly on the page. Everything lives in page coordinates, so it stays
   correct at any zoom.
 - 🌐 **Bring-your-own-key translation** — Gemini vision (the default, returns
-  alternatives + notes) or Google Cloud Translation v2.
-- 🔍 **Smart source-text detection** — digital PDFs are read straight from the
-  text layer; images and scans fall back to vision (or local OCR if you enable
-  it).
+  alternatives + notes), Google Cloud Translation v2, or DeepL API Free/Pro.
+- 🔍 **Smart source-text detection** — reconstruct digital PDF text by spatial
+  lines and columns, including RTL and vertical Japanese, with a reading-order
+  override for ambiguous pages. Images and scans use vision or optional OCR.
+- 📚 **Lazy PDF pages** — opening reads page metadata, then renders pages on
+  demand with a cache limited to three pages and 64 MiB of bitmap/text data.
+  Source bytes, transient render workers, fonts and GPU textures use additional
+  memory. Off-page translation textures are released.
 - 💾 **Token-saving cache** — repeat translations of the same text are instant
   and free, served from a local cache.
 - 📐 **Live, faithful preview** — translated regions render on the page exactly
@@ -69,12 +73,15 @@ cargo test           # run the test suite (incl. a headless PDF render test)
 
 ## 🔑 Translating: your API key
 
-The default translator is **Google Gemini** (vision) — its free tier includes
-image input, and it returns alternatives and notes. **Google Cloud Translation**
+The default translator is **Google Gemini** (vision), using the stable
+`gemini-3.5-flash-lite` model for new settings. Existing model choices are
+preserved. You can edit the model under Settings. Gemini returns alternatives
+and notes. **Google Cloud Translation**
 (v2) is also supported: pick it under **Settings → Provider**. (It needs the
 Cloud Translation API enabled on your project plus an API key. Because it
 translates *text*, it works on digital PDFs directly; image/scanned pages need
-the `ocr` feature to extract text first.) DeepL and Kagi aren't implemented yet.
+the `ocr` feature to extract text first.) DeepL API Free and Pro are also supported (Free keys end in `:fx`). Kagi is not
+implemented yet.
 
 **Add your key in the app** via **Settings → API key**. It's stored locally in
 `secrets.json` in your config dir (owner-only, never committed to git), and each
@@ -92,9 +99,24 @@ export EXPAT_JUNK_API_KEY=<your-gemini-api-key>   # bash/zsh
 
 Then open a document, drag a box over some text, and click **Translate
 selection** — or draw several regions and use **Edit → Translate all** to do
-them in one go. Repeat translations of the same text are served from a local
-cache (`~/.cache/expat-junk/translations.json`) — instant and free. Japanese and
-other CJK text renders via a bundled Noto Sans JP font.
+them in one go. Batch translations reuse a local cache in the platform cache directory
+(`~/.cache/expat-junk/translations.json` on Linux). Text providers reuse exact
+source text; vision keys also include the image. Translation crops are rendered
+at a fixed source scale, so viewer zoom does not change their cache keys. Keys cover the model, languages,
+document context, and prompt version. **Re-translate** requests a fresh API
+result and preserves your presentation edits; it can incur provider charges.
+Bundled Noto fonts cover Japanese, Chinese, Korean, Arabic, Hebrew, Hindi, Thai,
+Vietnamese, Cyrillic and Latin. Preview and export share Unicode shaping, bidi
+layout, combining-mark positioning, font fallback and line breaking, without
+requiring installed fonts.
+
+Use **Document context / terminology** in the right panel to supply the document
+type, tone, or terms to preserve. Gemini and DeepL use this context; Google Cloud
+Translation v2 does not. Context is saved in the project. **PDF reading order** can be set to Automatic,
+Left to right, Right to left, or Vertical Japanese. Reconstruction of untagged
+PDFs is heuristic; review extracted text for unusual layouts and complex tables.
+Translations made with
+previous settings are marked in the panel and included in **Translate all**.
 
 ---
 
@@ -103,14 +125,20 @@ other CJK text renders via a bundled Noto Sans JP font.
 - 📁 **Save / resume** — **File → Save project** writes a `.expj` file (your
   regions and translations; it references the source document *by path* rather
   than embedding it). **File → Open project** restores a session. The title bar
-  shows a `*` when there are unsaved changes.
+  shows a `*` when there are unsaved changes. Opening another file or closing
+  the app prompts before discarding unsaved work. Saves replace the project
+  atomically. New saves record a source fingerprint, so replacing the source
+  document is detected on resume and export.
   - Shortcuts: `Ctrl/Cmd+S` save · `Ctrl/Cmd+O` open document · `Ctrl/Cmd+E`
     export.
 - 📤 **Export** — **File → Export translated…** writes a PDF where each
   translated region is covered with a background-matched box and the translation
   is drawn on top (CJK included). For **PDF sources the original vector content
   is preserved** — untranslated text stays sharp and selectable, and only the
-  translated regions are overlaid. Image sources export as a full-page raster.
+  translated regions are overlaid, including on cropped, offset, and rotated
+  PDF pages. Export renders one source page at a time on a background worker,
+  using a snapshot of regions and translations. Image sources export as a full-page raster. Exporting over the source
+  document is refused. Nonstandard PDF `UserUnit` values are currently unsupported.
   *(Background matching is a flat fill, so textured or photo backgrounds may show
   a faint seam.)*
 

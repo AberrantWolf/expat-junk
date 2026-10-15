@@ -16,9 +16,11 @@ mod document;
 mod export;
 mod fonts;
 mod ocr;
+mod persistence;
 mod project;
 mod secrets;
 mod translate;
+mod translation;
 mod viewer;
 
 fn main() -> eframe::Result<()> {

@@ -1,13 +1,7 @@
 //! User settings and credentials.
 //!
-//! Non-secret settings (chosen provider, default target language, model name)
-//! live in a JSON file under the platform config dir (`directories`). API keys
-//! are stored separately via the OS keychain (`keyring`) so they never touch
-//! the settings file or version control.
-//!
-//! NOTE: `keyring` v4 needs a platform backend feature enabled to actually
-//! persist secrets (e.g. secret-service on Linux). Until one is wired up,
-//! [`load_api_key`] falls back to the `EXPAT_JUNK_API_KEY` env var.
+//! Settings live in settings.json; credentials live separately in secrets.json.
+//! EXPAT_JUNK_API_KEY overrides the selected provider's saved credential.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -15,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::translate::TextApi;
 
 /// Which backend the user has selected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Backend {
     GeminiVision { model: String },
     TesseractText { api: TextApi },
@@ -24,7 +18,7 @@ pub enum Backend {
 impl Default for Backend {
     fn default() -> Self {
         Backend::GeminiVision {
-            model: "gemini-flash-lite-latest".to_string(),
+            model: "gemini-3.5-flash-lite".to_string(),
         }
     }
 }
@@ -169,14 +163,19 @@ impl Language {
 }
 
 /// Persisted, non-secret settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub backend: Backend,
     pub target_lang: String,
+    /// Optional document context / terminology sent to Gemini and DeepL.
+    #[serde(default)]
+    pub context: String,
     /// OCR source language as a Tesseract code (e.g. `eng`, `jpn`, `deu`). Only
     /// used for the OCR fallback on pages with no text layer; the matching
     /// tessdata must be installed. Vision/text-layer paths don't need it.
     pub source_lang: String,
+    #[serde(default)]
+    pub reading_direction: junk_libs_platen::reading_order::Direction,
 }
 
 impl Default for Settings {
@@ -184,7 +183,9 @@ impl Default for Settings {
         Settings {
             backend: Backend::default(),
             target_lang: "en".to_string(),
+            context: String::new(),
             source_lang: "eng".to_string(),
+            reading_direction: Default::default(),
         }
     }
 }
@@ -212,7 +213,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(path, json);
+            let _ = crate::persistence::write(&path, &json);
         }
     }
 }

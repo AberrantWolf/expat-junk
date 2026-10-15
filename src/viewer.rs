@@ -5,9 +5,10 @@
 //! lives in the `junk-libs-egui-docview` crate as `DocView`, driven by the
 //! `PageModel` our [`crate::document::Document`] implements. Everything
 //! translation-specific that the old in-repo viewer carried lives here instead:
-//! the bundled CJK fonts, the per-region rendered-patch cache, and the
+//! the per-region rendered-patch cache and the
 //! [`RegionOverlay`] that paints each translated region's styled patch over the
-//! page — the live, in-app preview of the export overlay.
+//! page — the live, in-app preview of the export overlay. Fonts and shaping
+//! are shared with export through the GUI-independent text renderer.
 //!
 //! The patch is rasterized with the **same** [`crate::export::render_region_patch`]
 //! the exporter uses, so the preview is faithful (edited text, rotation, bold,
@@ -16,35 +17,20 @@
 
 use std::collections::HashMap;
 
-use ab_glyph::FontRef;
 use egui::Color32;
 use image::Rgba;
 use junk_libs_egui_docview::{OverlayCtx, RegionOverlay};
 
-use crate::app::{Justify, Rotate, Translated};
 use crate::document::RegionId;
 use crate::export::render_region_patch;
+use crate::translation::{Justify, Rotate, Translated};
 
-/// Persistent translation-overlay state, owned by the app across frames: the two
-/// weight-pinned fonts and the GPU-uploaded patch cache.
+/// Persistent GPU patch cache; shaping uses the same shared renderer as export.
+#[derive(Default)]
 pub struct TranslationOverlay {
-    /// Fonts used to rasterize the preview patches — the same bundled CJK font the
-    /// export uses (regular + bold, weight-pinned), so the preview matches output.
-    font: FontRef<'static>,
-    font_bold: FontRef<'static>,
     /// Cached, GPU-uploaded translation patches keyed by region, rebuilt only when
     /// a region's text/style/size changes.
     patches: HashMap<RegionId, CachedPatch>,
-}
-
-impl Default for TranslationOverlay {
-    fn default() -> Self {
-        Self {
-            font: crate::fonts::weighted(false),
-            font_bold: crate::fonts::weighted(true),
-            patches: HashMap::new(),
-        }
-    }
 }
 
 impl TranslationOverlay {
@@ -63,16 +49,19 @@ impl TranslationOverlay {
         TranslationFrame {
             results,
             show,
-            font: &self.font,
-            font_bold: &self.font_bold,
             patches: &mut self.patches,
         }
     }
 
     /// Drop cached patches whose regions no longer have a translation (deleted or
     /// cleared), releasing their texture memory. Call after the frame renders.
-    pub fn prune(&mut self, results: &HashMap<RegionId, Translated>) {
-        self.patches.retain(|id, _| results.contains_key(id));
+    pub fn prune(
+        &mut self,
+        results: &HashMap<RegionId, Translated>,
+        visible: &std::collections::HashSet<RegionId>,
+    ) {
+        self.patches
+            .retain(|id, _| results.contains_key(id) && visible.contains(id));
     }
 }
 
@@ -93,6 +82,7 @@ struct PatchKey {
     size_pt: Option<f32>,
     w: u32,
     h: u32,
+    scale: f32,
 }
 
 /// One frame's borrow of [`TranslationOverlay`] + the current results, wired into
@@ -100,14 +90,12 @@ struct PatchKey {
 pub struct TranslationFrame<'a> {
     results: &'a HashMap<RegionId, Translated>,
     show: bool,
-    font: &'a FontRef<'static>,
-    font_bold: &'a FontRef<'static>,
     patches: &'a mut HashMap<RegionId, CachedPatch>,
 }
 
 impl RegionOverlay for TranslationFrame<'_> {
     fn paint(&mut self, ctx: &OverlayCtx) -> bool {
-        if !self.show {
+        if !self.show || !ctx.painter().clip_rect().intersects(ctx.screen_rect()) {
             return false;
         }
         let id = ctx.id();
@@ -141,9 +129,10 @@ impl RegionOverlay for TranslationFrame<'_> {
             size_pt: t.style.size_pt,
             w: w_px,
             h: h_px,
+            scale,
         };
         if self.patches.get(&id).map(|c| &c.key) != Some(&key) {
-            let patch = render_region_patch(w_px, h_px, bg, t, self.font, self.font_bold, scale);
+            let patch = render_region_patch(w_px, h_px, bg, t, scale);
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [patch.width() as usize, patch.height() as usize],
                 patch.as_raw(),

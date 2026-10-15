@@ -6,6 +6,7 @@
 //! hardening. The `EXPAT_JUNK_API_KEY` env var still overrides stored keys (see
 //! [`crate::config::load_api_key`]).
 
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -38,29 +39,18 @@ impl Secrets {
     }
 
     /// Set (or, with an empty value, clear) a provider's key, and persist.
-    pub fn set(&mut self, provider: &str, key: String) {
+    pub fn set(&mut self, provider: &str, key: String) -> Result<()> {
+        let mut keys = self.keys.clone();
+        let key = key.trim().to_owned();
         if key.is_empty() {
-            self.keys.remove(provider);
+            keys.remove(provider);
         } else {
-            self.keys.insert(provider.to_owned(), key);
+            keys.insert(provider.to_owned(), key);
         }
-        self.save();
-    }
-
-    fn save(&self) {
-        let Some(path) = Self::path() else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let Ok(json) = serde_json::to_vec_pretty(&self.keys) else {
-            return;
-        };
-        if std::fs::write(&path, json).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        let path = Self::path().context("no config directory available")?;
+        let json = serde_json::to_vec_pretty(&keys)?;
+        crate::persistence::write(&path, &json)?;
+        self.keys = keys;
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 # Expat Junk remaining audit findings
 
-Updated October 15, 2026. This document tracks outstanding issues and validation
+Updated October 21, 2026. This document tracks outstanding issues and validation
 work only; completed changes have been removed.
 
 ## Remaining priorities
@@ -32,8 +32,15 @@ context is useful infrastructure; it is not a substitute for that evaluation.
 
 ## Outstanding validation
 
-- Run the optional OCR CI job with Tesseract/Leptonica; those dependencies were
-  unavailable locally.
 - Exercise live provider requests, graphical interaction and signed release
   bundles. Local provider payload tests do not cover these integrations.
-- Run a dependency vulnerability scan.
+
+## Remaining dependency maintenance
+
+RustSec flags `paste`, `ttf-parser`, `zbus_names`, `zvariant`, and
+`zvariant_derive` as unmaintained. Track their upstream migrations separately;
+no patched releases are listed for these maintenance advisories. Avoid blanket
+advisory ignores.
+
+Cross-platform CI and optional OCR checks still need to run against the updated
+dependencies. Local default checks do not cover those integrations.

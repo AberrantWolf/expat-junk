@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 base64 = "0.22.1"
 directories = "6.0.0"
 eframe = "0.34.3"
@@ -22,16 +22,16 @@ image = "0.25.10"
 # - text: Unicode shaping, bidi layout, bundled fallback fonts and rasterization.
 # - platen: render core (pure Rust — no binary downloads; used directly by
 #   export.rs render-back tests).
-junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
-junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
-junk-libs-text = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
-junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
-junk-libs-platen = { git = "https://github.com/AberrantWolf/junk-libs", rev = "f8b83dafc73b25b63143caab42fc74bdff260568" }
+junk-libs-egui-docview = { git = "https://github.com/AberrantWolf/junk-libs", rev = "a1ea376a4d53c7ec0c891a70311dc724a5804dcd" }
+junk-libs-egui-pdfdoc = { git = "https://github.com/AberrantWolf/junk-libs", rev = "a1ea376a4d53c7ec0c891a70311dc724a5804dcd" }
+junk-libs-text = { git = "https://github.com/AberrantWolf/junk-libs", rev = "a1ea376a4d53c7ec0c891a70311dc724a5804dcd" }
+junk-libs-raster = { git = "https://github.com/AberrantWolf/junk-libs", rev = "a1ea376a4d53c7ec0c891a70311dc724a5804dcd" }
+junk-libs-platen = { git = "https://github.com/AberrantWolf/junk-libs", rev = "a1ea376a4d53c7ec0c891a70311dc724a5804dcd" }
 leptess = { version = "0.14.0", optional = true }
-lopdf = "0.41.0"
+lopdf = "0.44.0"
 # `images` enables embedding rasters (from_dynamic_image takes raw RGBA, so no
 # format-decode feature is needed); drop the heavy default `html` stack.
-printpdf = { version = "0.9.1", default-features = false, features = ["images"] }
+printpdf = { version = "0.11.3", default-features = false, features = ["images"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }

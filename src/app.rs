@@ -16,6 +16,7 @@ use anyhow::Result;
 
 use crate::cache::{self, TranslationCache};
 use crate::config::{Backend, Settings};
+use crate::desktop::OpenRequests;
 use crate::document::{Document, RegionId};
 use crate::export;
 use crate::ocr;
@@ -64,8 +65,7 @@ struct Loading {
 
 /// A menu/toolbar/shortcut action, executed after the panels render.
 enum Action {
-    OpenDoc,
-    OpenProject,
+    Open(OpenTarget),
     SaveProject,
     SaveProjectAs,
     Export,
@@ -77,7 +77,29 @@ enum Action {
     ToggleSettings,
 }
 
+enum OpenTarget {
+    DocumentDialog,
+    ProjectDialog,
+    Path(PathBuf),
+}
+
+fn protect_session(
+    action: Option<Action>,
+    has_unsaved_work: bool,
+    confirmation: &mut Option<Action>,
+) -> Option<Action> {
+    if has_unsaved_work && matches!(action, Some(Action::Open(_) | Action::Quit)) {
+        *confirmation = action;
+        None
+    } else {
+        action
+    }
+}
+
 pub struct App {
+    open_requests: OpenRequests,
+    /// Session-changing action awaiting an explicit discard decision.
+    confirmation: Option<Action>,
     settings: Settings,
     document: Option<Document>,
     /// Path of the open source document (for project save / export defaults).
@@ -116,9 +138,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open_requests: OpenRequests) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        let repaint = cc.egui_ctx.clone();
+        open_requests.set_waker(Arc::new(move || repaint.request_repaint()));
         Self {
+            open_requests,
+            confirmation: None,
             settings: Settings::load(),
             document: None,
             source_path: None,
@@ -150,6 +176,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         let App {
+            open_requests,
+            confirmation,
             settings,
             document,
             source_path,
@@ -245,6 +273,9 @@ impl eframe::App for App {
             ui.disable();
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        if confirmation.is_some() {
+            ui.disable();
+        }
 
         if let Some(doc) = document.as_mut() {
             if let Err(e) = doc.poll_render() {
@@ -303,11 +334,12 @@ impl eframe::App for App {
         if close_requested && has_unsaved_work {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        let mut action: Option<Action> = if close_requested && has_unsaved_work {
-            Some(Action::Quit)
-        } else {
-            None
-        };
+        let mut action: Option<Action> =
+            if close_requested && has_unsaved_work && confirmation.is_none() {
+                Some(Action::Quit)
+            } else {
+                None
+            };
 
         // Count regions that still need translating (for the batch menu item).
         let untranslated = document
@@ -325,11 +357,11 @@ impl eframe::App for App {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open document…").clicked() {
-                        action = Some(Action::OpenDoc);
+                        action = Some(Action::Open(OpenTarget::DocumentDialog));
                         ui.close();
                     }
                     if ui.button("Open project…").clicked() {
-                        action = Some(Action::OpenProject);
+                        action = Some(Action::Open(OpenTarget::ProjectDialog));
                         ui.close();
                     }
                     ui.separator();
@@ -462,12 +494,12 @@ impl eframe::App for App {
         }
 
         // Keyboard shortcuts (only if no menu/toolbar action already fired).
-        if action.is_none() && loading.is_none() {
+        if action.is_none() && loading.is_none() && confirmation.is_none() {
             action = ctx.input(|i| {
                 if i.modifiers.command && i.key_pressed(egui::Key::S) {
                     Some(Action::SaveProject)
                 } else if i.modifiers.command && i.key_pressed(egui::Key::O) {
-                    Some(Action::OpenDoc)
+                    Some(Action::Open(OpenTarget::DocumentDialog))
                 } else if i.modifiers.command && i.key_pressed(egui::Key::E) {
                     Some(Action::Export)
                 } else {
@@ -476,46 +508,65 @@ impl eframe::App for App {
             });
         }
 
-        if (*dirty || pending.is_some() || exporting.is_some() || !queue.is_empty())
-            && matches!(
-                action,
-                Some(Action::OpenDoc | Action::OpenProject | Action::Quit)
-            )
-        {
-            let discard = rfd::MessageDialog::new()
-                .set_title("Unsaved project")
-                .set_description(
-                    "Discard unsaved changes and pending work? Cancel and save the project first to keep your work.",
-                )
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::OkCancel)
-                .show();
-            if discard != rfd::MessageDialogResult::Ok {
-                action = None;
+        // OS requests wait until loading finishes and use the same discard guard
+        // as menu actions. Consume each request once, including when cancelled.
+        if action.is_none() && loading.is_none() && confirmation.is_none() {
+            match open_requests.take() {
+                Ok(Some(path)) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    action = Some(Action::Open(OpenTarget::Path(path)));
+                }
+                Err(message) => *error = Some(message.into()),
+                Ok(None) => {}
+            }
+        }
+
+        action = protect_session(
+            action,
+            *dirty || pending.is_some() || exporting.is_some() || !queue.is_empty(),
+            confirmation,
+        );
+        if confirmation.is_some() {
+            let response = egui::Modal::new(egui::Id::new("unsaved_project")).show(&ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.heading("Unsaved project");
+                ui.label("Discard unsaved changes and pending work? Cancel and save the project first to keep your work.");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        Some(false)
+                    } else if ui.button("Discard and continue").clicked() {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }).inner
+            });
+            if response.inner == Some(true) {
+                action = confirmation.take();
+            } else if response.inner == Some(false) || response.should_close() {
+                *confirmation = None;
             }
         }
 
         // --- execute the action ----------------------------------------------
         match action {
             None => {}
-            Some(Action::OpenDoc) => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Documents", &["pdf", "png", "jpg", "jpeg", "webp", "tiff"])
-                    .pick_file()
-                {
+            Some(Action::Open(target)) => {
+                let path = match target {
+                    OpenTarget::DocumentDialog => rfd::FileDialog::new()
+                        .add_filter("Documents", &["pdf", "png", "jpg", "jpeg", "webp", "tiff"])
+                        .pick_file(),
+                    OpenTarget::ProjectDialog => rfd::FileDialog::new()
+                        .add_filter("expat-junk project", &[project::EXTENSION])
+                        .pick_file(),
+                    OpenTarget::Path(path) => Some(path),
+                };
+                if let Some(path) = path {
                     *pending = None;
+                    *exporting = None;
                     queue.clear();
-                    *loading = Some(start_loading(path, false, &ctx));
-                }
-            }
-            Some(Action::OpenProject) => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("expat-junk project", &[project::EXTENSION])
-                    .pick_file()
-                {
-                    *pending = None;
-                    queue.clear();
-                    *loading = Some(start_loading(path, true, &ctx));
+                    *loading = Some(start_loading(path, &ctx));
                 }
             }
             Some(Action::SaveProject) => save_project(
@@ -571,6 +622,7 @@ impl eframe::App for App {
             }
             Some(Action::Quit) => {
                 *pending = None;
+                *exporting = None;
                 queue.clear();
                 *dirty = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1300,11 +1352,14 @@ fn pending_is_current(p: &Pending, doc: Option<&Document>, settings: &Settings) 
         })
 }
 
-fn start_loading(path: PathBuf, is_project: bool, ctx: &egui::Context) -> Loading {
+fn start_loading(path: PathBuf, ctx: &egui::Context) -> Loading {
     let (tx, rx) = mpsc::channel();
     let source = path.clone();
     let repaint = ctx.clone();
     std::thread::spawn(move || {
+        let is_project = source
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(project::EXTENSION));
         let result = if is_project {
             project::Project::load(&source)
                 .and_then(|p| project::open_document(&p).map(|d| Loaded::Project(Box::new(p), d)))
@@ -1322,6 +1377,84 @@ mod tests {
     use super::*;
     use crate::document::Rect;
     use crate::translate::TranslationResult;
+
+    #[test]
+    fn cancelling_an_external_open_preserves_the_session_and_consumes_the_request() {
+        let requests = OpenRequests::default();
+        requests.request([PathBuf::from("incoming.pdf")]);
+        let action = Action::Open(OpenTarget::Path(requests.take().unwrap().unwrap()));
+        let mut confirmation = None;
+        assert!(protect_session(Some(action), true, &mut confirmation).is_none());
+        assert!(matches!(
+            confirmation.take(),
+            Some(Action::Open(OpenTarget::Path(_)))
+        ));
+        assert_eq!(requests.take().unwrap(), None);
+
+        // A clean session opens without prompting, and an accepted discard
+        // retains the requested path for the shared background loader.
+        let open = || {
+            Some(Action::Open(OpenTarget::Path(PathBuf::from(
+                "incoming.pdf",
+            ))))
+        };
+        let clean = protect_session(open(), false, &mut confirmation);
+        assert!(confirmation.is_none());
+        assert!(protect_session(open(), true, &mut confirmation).is_none());
+        let accepted = confirmation.take();
+        for action in [clean, accepted] {
+            assert!(
+                matches!(action, Some(Action::Open(OpenTarget::Path(path))) if path == std::path::Path::new("incoming.pdf"))
+            );
+        }
+        for action in [
+            Action::Open(OpenTarget::DocumentDialog),
+            Action::Open(OpenTarget::ProjectDialog),
+            Action::Quit,
+        ] {
+            assert!(protect_session(Some(action), true, &mut confirmation).is_none());
+            assert!(confirmation.take().is_some());
+        }
+    }
+
+    #[test]
+    fn desktop_paths_load_images_projects_and_errors_on_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("書類 with spaces.png");
+        image::RgbaImage::new(10, 20).save(&image).unwrap();
+        let ctx = egui::Context::default();
+        let load = |path| {
+            start_loading(path, &ctx)
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        };
+        let Loaded::Document(doc) = load(image.clone()).unwrap() else {
+            panic!("image loaded as a project");
+        };
+        assert_eq!(doc.pages.len(), 1);
+
+        let settings = Settings::default();
+        let project = project::build(
+            image,
+            0,
+            settings.source_lang,
+            settings.reading_direction,
+            settings.target_lang,
+            "saved context".into(),
+            settings.backend,
+            &doc,
+            HashMap::new(),
+        );
+        let path = dir.path().join("session.EXPJ");
+        project.save(&path).unwrap();
+        let Loaded::Project(project, reopened) = load(path).unwrap() else {
+            panic!("project loaded as an image");
+        };
+        assert_eq!(project.context, "saved context");
+        assert_eq!(reopened.pages.len(), 1);
+        assert!(load(dir.path().join("missing.pdf")).is_err());
+    }
 
     struct Stub;
     impl Translator for Stub {

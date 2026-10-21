@@ -69,6 +69,15 @@ cargo build          # build only
 cargo test           # run the test suite (incl. a headless PDF render test)
 ```
 
+Pass a PDF, image, or `.expj` project path to open it at startup, for example
+`cargo run -- "document with spaces.pdf"`. Open one file at a time; requests for
+multiple files show an error instead of replacing documents in succession.
+Desktop **Open With** launches use the same loader. The macOS app bundle also
+handles Finder opens and files dropped on its Dock icon while running, including
+project files. Opening another file prompts before discarding unsaved work.
+The Windows ZIP does not install file associations; choose `expat-junk.exe`
+using **Open With**. Linux desktop integration uses the packaged `.desktop` file.
+
 ### Test release packages
 
 In GitHub, open **Actions → Release → Run workflow** and select the branch to

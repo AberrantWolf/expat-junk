@@ -2,8 +2,8 @@
 Type=Application
 Name=Expat Junk
 Comment=Translate PDFs and images region by region
-Exec=expat-junk
+Exec=expat-junk %f
 Icon=expat-junk
 Categories=Office;Graphics;Utility;
-MimeType=application/pdf;image/png;image/jpeg;
+MimeType=application/pdf;image/png;image/jpeg;image/webp;image/tiff;
 Terminal=false

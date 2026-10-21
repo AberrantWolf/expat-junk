@@ -12,6 +12,7 @@
 mod app;
 mod cache;
 mod config;
+mod desktop;
 mod document;
 mod export;
 mod fonts;
@@ -24,10 +25,14 @@ mod translation;
 mod viewer;
 
 fn main() -> eframe::Result<()> {
+    let open_requests = desktop::OpenRequests::default();
+    open_requests.startup_arguments(std::env::args_os().skip(1));
+    #[cfg(target_os = "macos")]
+    let _open_file_events = desktop::macos::OpenFileEvents::install(open_requests.clone());
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "expat-junk",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, open_requests)))),
     )
 }

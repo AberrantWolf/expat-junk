@@ -28,14 +28,48 @@
     <array>
         <dict>
             <key>CFBundleTypeName</key>
-            <string>PDF Document</string>
+            <string>PDF or Image Document</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
             <key>LSItemContentTypes</key>
             <array>
                 <string>com.adobe.pdf</string>
                 <string>public.image</string>
             </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Expat Junk Project</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.aberrantwolf.expat-junk.project</string>
+            </array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.aberrantwolf.expat-junk.project</string>
+            <key>UTTypeDescription</key>
+            <string>Expat Junk Project</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.json</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>expj</string>
+                </array>
+            </dict>
         </dict>
     </array>
 </dict>

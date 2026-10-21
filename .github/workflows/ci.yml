@@ -86,7 +86,8 @@ jobs:
 
   ocr:
     name: Optional OCR feature (Linux)
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04's Leptonica headers fail binding generation in leptonica-sys.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
         with:

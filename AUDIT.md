@@ -12,7 +12,7 @@ work only; completed changes have been removed.
 | Medium | Projects refer to an absolute source path. Fingerprints detect changed content but do not help locate a moved file. Legacy projects also have unknown translation provenance and no historical source fingerprint. | Add source relinking and save-time relative paths or portable projects; show unknown provenance for legacy results. |
 | Medium | Translations are raster overlays: translated text cannot be searched or selected, and original source text remains underneath. Export is not redaction. | Decide whether to add an accessible/searchable translation layer and a separate explicit redaction mode. |
 | Lower | The app has no password-entry workflow, bookmark navigation or UserUnit support. Upstream metadata exposes outlines but the adapter currently uses only page labels. | Extend the document/provider UI around typed errors and upstream metadata. |
-| Lower | Desktop file associations are advertised but startup arguments/macOS open-file events are not consumed. The release workflow fetches an unpinned continuous AppImage packaging tool; macOS entitlements allow executable memory without an established requirement. | Add native open-file handling, pin/checksum the packaging tool, and reduce signing entitlements after testing signed bundles. |
+| Lower | Desktop file associations are advertised but startup arguments/macOS open-file events are not consumed. macOS entitlements allow executable memory without an established requirement. | Add native open-file handling and reduce signing entitlements after testing signed bundles. |
 
 The next substantial investment should be real-document evaluation, manual source
 correction, and transactional cache storage. Keep the existing GUI and shared

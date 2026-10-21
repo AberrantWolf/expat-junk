@@ -1,11 +1,12 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +37,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           lfs: true
+      - name: Set package versions
+        shell: bash
+        run: |
+          PACKAGE_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            PACKAGE_VERSION="${GITHUB_REF_NAME#v}"
+            ARTIFACT_VERSION="$GITHUB_REF_NAME"
+          else
+            ARTIFACT_VERSION="v${PACKAGE_VERSION}-test-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -96,7 +109,6 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME}"
           APP="Expat Junk.app"
 
           mkdir -p "$APP/Contents/MacOS"
@@ -110,10 +122,10 @@ jobs:
           cp THIRD-PARTY.md assets/fonts/*OFL.txt "$APP/Contents/Resources/Licenses/"
 
           # Substitute version into Info.plist
-          sed "s/\${VERSION}/${VERSION#v}/g" assets/Info.plist > "$APP/Contents/Info.plist"
+          sed "s/\${VERSION}/${PACKAGE_VERSION}/g" assets/Info.plist > "$APP/Contents/Info.plist"
 
           echo "GUI_APP=${APP}" >> "$GITHUB_ENV"
-          echo "GUI_ARCHIVE=Expat-Junk-${VERSION}-${{ matrix.display_name }}.zip" >> "$GITHUB_ENV"
+          echo "GUI_ARCHIVE=Expat-Junk-${ARTIFACT_VERSION}-${{ matrix.display_name }}.zip" >> "$GITHUB_ENV"
 
       - name: Sign GUI .app bundle (macOS)
         if: runner.os == 'macOS' && env.HAS_MACOS_SIGNING == 'true'
@@ -164,8 +176,12 @@ jobs:
       - name: Package GUI (Linux AppImage)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          APPIMAGETOOL_VERSION: "1.9.1"
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          APPIMAGE_RUNTIME_VERSION: "20251108"
+          APPIMAGE_RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
         run: |
-          VERSION="${GITHUB_REF_NAME}"
           APPDIR="Expat-Junk.AppDir"
 
           mkdir -p "$APPDIR/usr/bin"
@@ -181,13 +197,19 @@ jobs:
           # Create AppRun symlink
           ln -s usr/bin/expat-junk "$APPDIR/AppRun"
 
-          # Download and run appimagetool
-          wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          # Pin and verify both tools: appimagetool otherwise fetches a moving runtime.
+          curl --fail --location --retry 3 --output appimagetool-x86_64.AppImage \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          curl --fail --location --retry 3 --output runtime-x86_64 \
+            "https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-x86_64"
+          echo "${APPIMAGETOOL_SHA256}  appimagetool-x86_64.AppImage" | sha256sum --check --strict
+          echo "${APPIMAGE_RUNTIME_SHA256}  runtime-x86_64" | sha256sum --check --strict
           chmod +x appimagetool-x86_64.AppImage
-          ./appimagetool-x86_64.AppImage --appimage-extract-and-run "$APPDIR" \
-            "Expat-Junk-${VERSION}-linux-x64.AppImage"
+          ARCH=x86_64 VERSION="$PACKAGE_VERSION" ./appimagetool-x86_64.AppImage \
+            --appimage-extract-and-run --runtime-file runtime-x86_64 "$APPDIR" \
+            "Expat-Junk-${ARTIFACT_VERSION}-linux-x64.AppImage"
 
-          echo "GUI_ARCHIVE=Expat-Junk-${VERSION}-linux-x64.AppImage" >> "$GITHUB_ENV"
+          echo "GUI_ARCHIVE=Expat-Junk-${ARTIFACT_VERSION}-linux-x64.AppImage" >> "$GITHUB_ENV"
 
       # --- Windows zip ---
 
@@ -195,7 +217,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $Version = "$env:GITHUB_REF_NAME"
+          $Version = $env:ARTIFACT_VERSION
           $GuiDir = "Expat-Junk-${Version}-${{ matrix.display_name }}"
           New-Item -ItemType Directory -Path $GuiDir
           # The render engine is pure Rust (junk-libs-platen) — the .exe is
@@ -215,8 +237,11 @@ jobs:
 
   release:
     name: Create Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:

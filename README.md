@@ -69,6 +69,20 @@ cargo build          # build only
 cargo test           # run the test suite (incl. a headless PDF render test)
 ```
 
+### Test release packages
+
+In GitHub, open **Actions → Release → Run workflow** and select the branch to
+build. A manual run packages Linux x64, macOS Intel/Apple Silicon, and Windows
+x64 without creating a GitHub release. Download the `gui-*` artifacts from the
+completed run. Test archive names include the package version and run number;
+the macOS bundle keeps the version from `Cargo.toml`. Configured macOS signing
+and notarization also run for these test packages.
+
+Linux packaging pins `appimagetool` 1.9.1 and the AppImage runtime release
+20251108, verifying both SHA-256 checksums before use. Update the versions and
+checksums together when refreshing the tooling. Pushing a `v*` tag still builds
+and publishes the release packages.
+
 ---
 
 ## 🔑 Translating: your API key
